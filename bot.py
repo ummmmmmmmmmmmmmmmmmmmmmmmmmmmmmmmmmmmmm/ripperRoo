@@ -1,5 +1,5 @@
 # bot.py
-import os, re, tempfile, asyncio, shutil
+import os, re, tempfile, asyncio, shutil, zipfile
 from typing import Optional, Tuple, List
 from urllib.parse import urlparse, parse_qs
 
@@ -11,9 +11,9 @@ import yt_dlp
 TOKEN = os.getenv("DISCORD_TOKEN")  # PowerShell: $env:DISCORD_TOKEN='...'
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")
 
-# Batching caps (change with env vars if your server has higher limits)
-MAX_ATTACHMENTS_PER_MESSAGE = int(os.getenv("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
-MAX_BATCH_BYTES = int(os.getenv("MAX_BATCH_BYTES", str(24 * 1024 * 1024)))  # ~24 MiB
+# Per-file upload cap (Discord default ~25 MiB for many servers; tune as needed)
+# If a generated .zip exceeds this, it will be split into multiple parts.
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(24 * 1024 * 1024)))  # ~24 MiB
 
 ALLOWED_DOMAINS = {
     "youtube.com", "www.youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be",
@@ -47,7 +47,7 @@ def detect_playlist(link: str) -> Tuple[bool, str]:
         # YouTube: list= param or /playlist path
         if host in {"youtube.com", "music.youtube.com", "m.youtube.com"}:
             qs = parse_qs(u.query or "")
-            if "list" in qs or u.path.startswith("/playlist"):
+            if "list" in qs or (u.path or "").startswith("/playlist"):
                 return True, "youtube"
         if host == "youtu.be":
             qs = parse_qs(u.query or "")
@@ -100,37 +100,73 @@ def _resolve_outpath(ydl: yt_dlp.YoutubeDL, entry: dict, fallback_exts=("mp3","m
         candidate = f"{root}.{ext}"
         if os.path.exists(candidate):
             return candidate
-    # Fallback to root.mp3 even if missing (caller may still find it)
     return f"{root}.mp3"
 
-async def download_all_to_mp3(link: str, tmpdir: str) -> List[Tuple[str, str]]:
+async def download_all_to_mp3(link: str, tmpdir: str) -> Tuple[List[Tuple[str, str]], str, bool]:
     """
-    Downloads single videos or whole playlists, returns [(filepath, display_name), ...] in order.
+    Downloads single videos or whole playlists.
+    Returns ([(filepath, display_name), ...], collection_title, is_playlist)
     """
     items: List[Tuple[str, str]] = []
     with yt_dlp.YoutubeDL(ydl_opts(tmpdir)) as ydl:
         info = ydl.extract_info(link, download=True)
 
         if "entries" in info and info["entries"]:
-            # Playlist: keep input order
+            title = info.get("title") or "playlist"
             for ent in info["entries"]:
                 if not ent:
                     continue
                 path = _resolve_outpath(ydl, ent)
-                title = ent.get("title") or "audio"
-                # normalize to .mp3 if present
+                track_title = ent.get("title") or "audio"
                 root, _ = os.path.splitext(path)
                 mp3 = root + ".mp3"
-                items.append((mp3 if os.path.exists(mp3) else path, f"{title}.mp3"))
+                items.append((mp3 if os.path.exists(mp3) else path, f"{track_title}.mp3"))
+            return items, title, True
         else:
-            # Single item
-            path = _resolve_outpath(ydl, info)
             title = info.get("title") or "audio"
+            path = _resolve_outpath(ydl, info)
             root, _ = os.path.splitext(path)
             mp3 = root + ".mp3"
             items.append((mp3 if os.path.exists(mp3) else path, f"{title}.mp3"))
+            return items, title, False
 
-    return items
+def _safe_base(name: str) -> str:
+    # Remove characters that dislike filenames on Windows/Linux
+    return re.sub(r'[\\/:*?"<>|]+', '_', name).strip()
+
+def chunk_by_size(paths: List[Tuple[str, str]], max_bytes: int) -> List[List[Tuple[str, str]]]:
+    """Greedy chunking by total size, preserves order."""
+    chunks: List[List[Tuple[str, str]]] = []
+    cur: List[Tuple[str, str]] = []
+    cur_bytes = 0
+    def flush():
+        nonlocal cur, cur_bytes
+        if cur:
+            chunks.append(cur)
+            cur = []
+            cur_bytes = 0
+    for p, name in paths:
+        size = os.path.getsize(p) if os.path.exists(p) else 0
+        if cur and cur_bytes + size > max_bytes:
+            flush()
+        if not cur and size > max_bytes:
+            chunks.append([(p, name)])
+            continue
+        cur.append((p, name))
+        cur_bytes += size
+    flush()
+    return chunks
+
+def make_zip_of_files(files: List[Tuple[str, str]], out_zip_path: str):
+    """Create a zip at out_zip_path including (path, arcname) pairs."""
+    with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p, display_name in files:
+            arcname = display_name  # keep friendly names inside zip
+            try:
+                zf.write(p, arcname=arcname)
+            except FileNotFoundError:
+                # Skip missing file quietly
+                continue
 
 async def send_files_batched(
     ctx: commands.Context,
@@ -139,39 +175,9 @@ async def send_files_batched(
     to_dm: bool,
     attribution: Optional[str]
 ):
-    """
-    Sends files in efficient batches under Discord limits, preserving order.
-    Uses MAX_ATTACHMENTS_PER_MESSAGE and MAX_BATCH_BYTES.
-    """
-    # Build batches by count and total bytes
-    batches: List[List[Tuple[str, str]]] = []
-    cur: List[Tuple[str, str]] = []
-    cur_bytes = 0
-
-    def flush():
-        nonlocal cur, cur_bytes
-        if cur:
-            batches.append(cur)
-            cur = []
-            cur_bytes = 0
-
-    for path, name in files:
-        size = os.path.getsize(path) if os.path.exists(path) else 0
-        # If adding this file would exceed limits, flush current batch first
-        if (len(cur) >= MAX_ATTACHMENTS_PER_MESSAGE) or (cur and cur_bytes + size > MAX_BATCH_BYTES):
-            flush()
-        # If single file itself exceeds limit, put it alone (may still fail if > per-file limit)
-        if not cur and size > MAX_BATCH_BYTES:
-            batches.append([(path, name)])
-            continue
-        cur.append((path, name))
-        cur_bytes += size
-    flush()
-
-    # Send each batch
-    total = len(batches)
-    for idx, batch in enumerate(batches, start=1):
-        files_payload = [discord.File(p, filename=n) for (p, n) in batch]
+    """Send one or more files, adding attribution in servers."""
+    total = len(files)
+    for idx, (path, name) in enumerate(files, start=1):
         content = None
         if ctx.guild is not None and attribution:
             suffix = f" — part {idx}/{total}" if total > 1 else ""
@@ -179,17 +185,11 @@ async def send_files_batched(
         try:
             if to_dm:
                 dm = await ctx.author.create_dm()
-                await dm.send(content=content, files=files_payload)
+                await dm.send(content=content, file=discord.File(path, filename=name))
             else:
-                await ctx.send(content=content, files=files_payload)
+                await ctx.send(content=content, file=discord.File(path, filename=name))
         except discord.HTTPException as e:
-            # If a batch fails (e.g., byte cap still too high), retry by halving the batch
-            if len(batch) > 1:
-                mid = len(batch) // 2
-                await send_files_batched(ctx, batch[:mid], to_dm=to_dm, attribution=attribution)
-                await send_files_batched(ctx, batch[mid:], to_dm=to_dm, attribution=attribution)
-            else:
-                await ctx.reply(f"❌ Failed to upload `{batch[0][1]}`: `{e}`", mention_author=False)
+            await ctx.reply(f"❌ Failed to upload `{name}`: `{e}`", mention_author=False)
 
 async def send_and_cleanup(ctx: commands.Context, files: List[Tuple[str, str]], to_dm: bool = False):
     """
@@ -223,7 +223,7 @@ class ConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Proceed (download all)", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Proceed (download all & zip)", style=discord.ButtonStyle.danger)
     async def proceed(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.value = True
         for child in self.children:
@@ -247,11 +247,8 @@ async def _help(ctx: commands.Context):
         f"{HELP_TEXT}\n\n[This message will go away in {countdown} seconds]",
         mention_author=False
     )
-    try:
-        await ctx.message.delete()
-    except (discord.Forbidden, discord.HTTPException):
-        pass
 
+    # LIVE countdown
     try:
         for t in range(countdown - 1, -1, -1):
             await asyncio.sleep(1)
@@ -259,25 +256,38 @@ async def _help(ctx: commands.Context):
     except discord.HTTPException:
         pass
     finally:
+        # Delete help prompt first...
         try:
             await msg.delete()
         except discord.HTTPException:
             pass
+        # ...then delete the user's *help invoke
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
-async def maybe_confirm_playlist(ctx: commands.Context, link: str) -> bool:
+async def maybe_confirm_playlist(ctx: commands.Context, link: str) -> Tuple[bool, Optional[str], Optional[discord.Message]]:
+    """
+    Returns (confirmed, provider, prompt_message)
+    - If not a playlist: (True, None, None)
+    - If Spotify: (False, None, None) with a notice sent
+    - If playlist and user confirms: (True, provider, prompt_msg)
+    - If cancelled/timeout: (False, provider_or_None, prompt_msg)
+    """
     is_pl, provider = detect_playlist(link)
     if not is_pl:
-        return True
+        return True, None, None
 
     if provider == "spotify":
         await ctx.reply("⚠️ That looks like a Spotify playlist. Spotify downloads aren’t supported.", mention_author=False)
-        return False
+        return False, None, None
 
     view = ConfirmView(ctx.author.id, timeout=30)
     provider_nice = "YouTube" if provider == "youtube" else "SoundCloud"
     prompt = await ctx.reply(
         f"⚠️ The link you sent appears to be a **{provider_nice} playlist**.\n"
-        f"This will attempt to download **all tracks**. Are you sure?",
+        f"This will attempt to download **all tracks** and send them as a **.zip**. Proceed?",
         view=view, mention_author=False
     )
     await view.wait()
@@ -286,13 +296,42 @@ async def maybe_confirm_playlist(ctx: commands.Context, link: str) -> bool:
             await prompt.edit(content="✅ Confirmed. Starting download…", view=None)
         except discord.HTTPException:
             pass
-        return True
+        return True, provider, prompt
     else:
         try:
             await prompt.edit(content="❎ Cancelled.", view=None)
         except discord.HTTPException:
             pass
-        return False
+        return False, provider, prompt
+
+def build_zip_parts(tmpdir: str, bundle_name: str, items: List[Tuple[str,str]]) -> List[Tuple[str, str]]:
+    """
+    Build one or more zip files under MAX_FILE_BYTES from items (path, display_name).
+    Returns list of (zip_path, zip_display_name).
+    """
+    safe = _safe_base(bundle_name) or "playlist"
+    chunks = chunk_by_size(items, MAX_FILE_BYTES)
+    out: List[Tuple[str, str]] = []
+    if len(chunks) == 1:
+        zip_path = os.path.join(tmpdir, f"{safe}.zip")
+        make_zip_of_files(chunks[0], zip_path)
+        # If it still exceeds MAX_FILE_BYTES (compression can be bigger), split in half
+        if os.path.getsize(zip_path) > MAX_FILE_BYTES and len(chunks[0]) > 1:
+            os.remove(zip_path)
+            half = len(chunks[0]) // 2
+            for i, sub in enumerate([chunks[0][:half], chunks[0][half:]], start=1):
+                part_path = os.path.join(tmpdir, f"{safe}_part{i}.zip")
+                make_zip_of_files(sub, part_path)
+                out.append((part_path, os.path.basename(part_path)))
+            return out
+        out.append((zip_path, os.path.basename(zip_path)))
+        return out
+    else:
+        for i, chunk in enumerate(chunks, start=1):
+            zip_path = os.path.join(tmpdir, f"{safe}_part{i}.zip")
+            make_zip_of_files(chunk, zip_path)
+            out.append((zip_path, os.path.basename(zip_path)))
+        return out
 
 @bot.command(name="rip")
 async def rip(ctx: commands.Context, link: Optional[str] = None):
@@ -304,17 +343,29 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
             return await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False)
         return await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
 
-    # Confirm playlists
-    confirmed = await maybe_confirm_playlist(ctx, link)
+    confirmed, provider, prompt_msg = await maybe_confirm_playlist(ctx, link)
     if not confirmed:
         return
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     status = await ctx.reply("⏳ Ripping…", mention_author=False)
     try:
-        items = await download_all_to_mp3(link, tmpdir)  # [(path,name), ...]
-        await status.edit(content=f"📤 Uploading… ({len(items)} track{'s' if len(items)!=1 else ''})")
-        await send_and_cleanup(ctx, items, to_dm=False)
+        items, title, is_pl = await download_all_to_mp3(link, tmpdir)  # [(path,name)], title, is_playlist
+        if is_pl:
+            await status.edit(content=f"🗜️ Zipping… ({len(items)} track{'s' if len(items)!=1 else ''})")
+            zip_parts = build_zip_parts(tmpdir, title, items)  # [(zip_path, zip_name)]
+            await status.edit(content=f"📤 Uploading zip{'s' if len(zip_parts)>1 else ''}…")
+            await send_and_cleanup(ctx, zip_parts, to_dm=False)
+            # Delete the playlist confirmation prompt after uploads finish
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except discord.HTTPException:
+                    pass
+        else:
+            await status.edit(content="📤 Uploading…")
+            await send_and_cleanup(ctx, items, to_dm=False)
+
         try:
             await status.delete()
         except discord.HTTPException:
@@ -337,16 +388,29 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
             return await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False)
         return await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
 
-    confirmed = await maybe_confirm_playlist(ctx, link)
+    confirmed, provider, prompt_msg = await maybe_confirm_playlist(ctx, link)
     if not confirmed:
         return
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     status = await ctx.reply("⏳ Ripping…", mention_author=False)
     try:
-        items = await download_all_to_mp3(link, tmpdir)
-        await status.edit(content=f"📤 Uploading to DM… ({len(items)} track{'s' if len(items)!=1 else ''})")
-        await send_and_cleanup(ctx, items, to_dm=True)
+        items, title, is_pl = await download_all_to_mp3(link, tmpdir)
+        if is_pl:
+            await status.edit(content=f"🗜️ Zipping… ({len(items)} track{'s' if len(items)!=1 else ''})")
+            zip_parts = build_zip_parts(tmpdir, title, items)
+            await status.edit(content=f"📤 Uploading to DM…")
+            await send_and_cleanup(ctx, zip_parts, to_dm=True)
+            # Delete the playlist confirmation prompt after uploads finish
+            if prompt_msg:
+                try:
+                    await prompt_msg.delete()
+                except discord.HTTPException:
+                    pass
+        else:
+            await status.edit(content="📤 Uploading to DM…")
+            await send_and_cleanup(ctx, items, to_dm=True)
+
         try:
             await status.delete()
         except discord.HTTPException:
