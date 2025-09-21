@@ -69,16 +69,29 @@ async def download_to_mp3(link: str, tmpdir: str) -> tuple[str, str]:
         return path, f"{title}.mp3"
 
 async def send_and_cleanup(ctx: commands.Context, file_path: str, file_name: str, to_dm: bool = False):
-    # Send the file
+    """
+    Sends the file. In servers, adds 'ripped by: DisplayName(Username)'.
+    After a successful send, deletes the invoking message (if permitted).
+    """
     if to_dm:
+        # DM: no attribution line, just send the file and an ack
         dm = await ctx.author.create_dm()
         await dm.send(file=discord.File(file_path, filename=file_name))
         ack = await ctx.reply("📩 Sent to your DMs.", mention_author=False)
     else:
-        await ctx.send(file=discord.File(file_path, filename=file_name))
+        # In a guild channel, attach the attribution line
+        attribution = None
+        if ctx.guild is not None:
+            display = ctx.author.display_name  # server nickname/display name
+            uname = ctx.author.name            # global username
+            attribution = f"ripped by: {display}({uname})"
+        await ctx.send(
+            content=attribution,
+            file=discord.File(file_path, filename=file_name)
+        )
         ack = None
 
-    # Delete the invoking message (requires Manage Messages in guild channels)
+    # Try to delete the invoking message
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
@@ -91,20 +104,17 @@ async def send_and_cleanup(ctx: commands.Context, file_path: str, file_name: str
 # ---------- commands ----------
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
-    # Send help with a live countdown, then delete it
     countdown = 5
     msg = await ctx.reply(
         f"{HELP_TEXT}\n\n[This message will go away in {countdown} seconds]",
         mention_author=False
     )
-
-    # Try to delete the user's *help command
+    # delete the user's help invocation
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-    # Update the countdown once per second
     try:
         for t in range(countdown - 1, -1, -1):
             await asyncio.sleep(1)
