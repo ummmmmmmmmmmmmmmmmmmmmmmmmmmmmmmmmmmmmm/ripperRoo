@@ -23,7 +23,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="*", intents=intents, help_command=None)
 
 HELP_TEXT = (
-    "**ripperRoo — quick ripper**\n"
+    "**ripperRoo — a Discord mp3 ripper created by d-rod**\n"
     "• `*rip <link>` — rip YouTube or SoundCloud audio and post it here\n"
     "• `*ripdm <link>` — rip and DM you the file\n\n"
     "_Tip: to auto-delete your command after sending files, give my role **Manage Messages** in this channel._"
@@ -69,6 +69,7 @@ async def download_to_mp3(link: str, tmpdir: str) -> tuple[str, str]:
         return path, f"{title}.mp3"
 
 async def send_and_cleanup(ctx: commands.Context, file_path: str, file_name: str, to_dm: bool = False):
+    # Send the file
     if to_dm:
         dm = await ctx.author.create_dm()
         await dm.send(file=discord.File(file_path, filename=file_name))
@@ -77,7 +78,7 @@ async def send_and_cleanup(ctx: commands.Context, file_path: str, file_name: str
         await ctx.send(file=discord.File(file_path, filename=file_name))
         ack = None
 
-    # Delete the invoking message (needs Manage Messages; not possible in DMs)
+    # Delete the invoking message (requires Manage Messages in guild channels)
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
@@ -90,28 +91,26 @@ async def send_and_cleanup(ctx: commands.Context, file_path: str, file_name: str
 # ---------- commands ----------
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
-    # Send the help menu
+    # Send help with a live countdown, then delete it
     countdown = 5
     msg = await ctx.reply(
         f"{HELP_TEXT}\n\n[This message will go away in {countdown} seconds]",
         mention_author=False
     )
 
-    # Try to delete the user's *help command after we've responded
+    # Try to delete the user's *help command
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
-        # Either missing perms or we're in DMs; ignore quietly
         pass
 
-    # Live countdown + delete help message
+    # Update the countdown once per second
     try:
         for t in range(countdown - 1, -1, -1):
             await asyncio.sleep(1)
-            # If already deleted, this will raise; we swallow it below
             await msg.edit(content=f"{HELP_TEXT}\n\n[This message will go away in {t} seconds]")
     except discord.HTTPException:
-        pass  # message might have been manually deleted or can't be edited
+        pass
     finally:
         try:
             await msg.delete()
@@ -121,7 +120,7 @@ async def _help(ctx: commands.Context):
 @bot.command(name="rip")
 async def rip(ctx: commands.Context, link: Optional[str] = None):
     if not link:
-        return await ctx.reply("Usage: `\*rip <link>`", mention_author=False)
+        return await ctx.reply("Usage: `*rip <link>`", mention_author=False)
     if not ok_domain(link):
         return await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
 
@@ -146,7 +145,7 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
 @bot.command(name="ripdm")
 async def ripdm(ctx: commands.Context, link: Optional[str] = None):
     if not link:
-        return await ctx.reply("Usage: `\*ripdm <link>`", mention_author=False)
+        return await ctx.reply("Usage: `*ripdm <link>`", mention_author=False)
     if not ok_domain(link):
         return await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
 
