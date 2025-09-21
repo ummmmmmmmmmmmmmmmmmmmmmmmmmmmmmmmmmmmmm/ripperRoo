@@ -6,17 +6,18 @@ import discord
 from discord.ext import commands
 import yt_dlp
 
-# --- token loading ---
-TOKEN = os.getenv("DISCORD_TOKEN")  # Set this in PowerShell: $env:DISCORD_TOKEN='YOUR_TOKEN'
-
-PREFIX = ":"
+# ===================== Config =====================
+TOKEN = os.getenv("DISCORD_TOKEN")  # PowerShell: $env:DISCORD_TOKEN='...'
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")  # set if ffmpeg lives elsewhere
 ALLOWED_DOMAINS = {"youtube.com", "www.youtube.com", "youtu.be", "music.youtube.com"}
+# ===================================================
 
-# Intents
+# Intents (message content required for custom text commands)
 intents = discord.Intents.default()
-intents.message_content = True  # Needed for prefix commands
+intents.message_content = True
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+# We keep a prefix (unused for rip=/ripdm=) so :help still works if you want it.
+bot = commands.Bot(command_prefix=":", intents=intents, help_command=None)
 
 # ---- helpers ----
 YTLINK = re.compile(r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s>]+)", re.IGNORECASE)
@@ -48,10 +49,11 @@ def _download_mp3(url: str, tempdir: str, kbps: int = 192) -> Tuple[str, str]:
         "noplaylist": True,
         "retries": 3,
         "socket_timeout": 15,
+        "ffmpeg_location": FFMPEG_BIN,  # <-- key bit so yt-dlp finds ffmpeg/ffprobe
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        if "entries" in info:
+        if "entries" in info:  # guard against playlists
             info = info["entries"][0]
         title = info.get("title", "audio")
         vid_id = info.get("id")
@@ -65,7 +67,8 @@ def _download_mp3(url: str, tempdir: str, kbps: int = 192) -> Tuple[str, str]:
 
 def _reencode_mp3(src: str, dst: str, bitrate_kbps: int) -> None:
     subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-b:a", f"{bitrate_kbps}k", dst],
+        [os.path.join(FFMPEG_BIN, "ffmpeg") if os.name == "nt" else "ffmpeg",
+         "-y", "-i", src, "-b:a", f"{bitrate_kbps}k", dst],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
     )
 
@@ -81,7 +84,7 @@ async def _send_audio(ctx: commands.Context, file_path: str, title: str, to_dm: 
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
 
-# === Commands ===
+# === Core workers (kept as commands so we can reuse ctx & cooldowns) ===
 @commands.cooldown(1, 20, commands.BucketType.user)
 @bot.command(name="rip")
 async def rip(ctx: commands.Context, url: Optional[str]=None):
@@ -89,9 +92,9 @@ async def rip(ctx: commands.Context, url: Optional[str]=None):
         m = YTLINK.search(ctx.message.content)
         url = m.group(1) if m else None
     if not url or not _is_allowed_url(url):
-        return await ctx.reply("Give me a valid YouTube link, e.g. `:rip https://youtu.be/...`")
+        return await ctx.reply("Give me a valid YouTube link, e.g. `rip= https://youtu.be/...`")
 
-    async with ctx.typing():  # FIXED
+    async with ctx.typing():
         tempdir = tempfile.mkdtemp(prefix="rip_")
         try:
             loop = asyncio.get_event_loop()
@@ -107,7 +110,7 @@ async def rip(ctx: commands.Context, url: Optional[str]=None):
                         break
                 else:
                     mb = limit / (1024*1024)
-                    return await ctx.reply(f"⚠️ File too large for this server (~{mb:.0f} MB). Try `:ripdm {url}`.")
+                    return await ctx.reply(f"⚠️ File too large for this server (~{mb:.0f} MB). Try `ripdm= <url>`.")
 
             await _send_audio(ctx, mp3_path, title, to_dm=False)
         except commands.CommandOnCooldown as c:
@@ -125,9 +128,9 @@ async def ripdm(ctx: commands.Context, url: Optional[str]=None):
         m = YTLINK.search(ctx.message.content)
         url = m.group(1) if m else None
     if not url or not _is_allowed_url(url):
-        return await ctx.reply("Give me a valid YouTube link, e.g. `:ripdm https://youtu.be/...`")
+        return await ctx.reply("Give me a valid YouTube link, e.g. `ripdm= https://youtu.be/...`")
 
-    async with ctx.typing():  # FIXED
+    async with ctx.typing():
         tempdir = tempfile.mkdtemp(prefix="rip_")
         try:
             loop = asyncio.get_event_loop()
@@ -155,14 +158,40 @@ async def ripdm(ctx: commands.Context, url: Optional[str]=None):
             try: shutil.rmtree(tempdir)
             except Exception: pass
 
-@bot.command(name="help")
-async def _help(ctx: commands.Context):
-    await ctx.reply(
-        "Commands:\n"
-        "• `:rip <YouTube URL>` — upload MP3 here\n"
-        "• `:ripdm <YouTube URL>` — DM the MP3 to you\n"
-        "Make sure I have Send Messages + Attach Files permissions."
-    )
+# === Custom message-style command parser for "rip=" and "ripdm=" ===
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    content = message.content.strip()
+
+    # rip= <url>
+    if content.lower().startswith("rip="):
+        url = content[4:].strip()
+        ctx = await bot.get_context(message)
+        await rip(ctx, url=url)
+        return
+
+    # ripdm= <url>
+    if content.lower().startswith("ripdm="):
+        url = content[6:].strip()
+        ctx = await bot.get_context(message)
+        await ripdm(ctx, url=url)
+        return
+
+    # simple help keyword (optional)
+    if content.lower().strip() in {"help", "rip help", "rip=help"}:
+        await message.channel.send(
+            "Usage:\n"
+            "• `rip= <YouTube URL>` — upload MP3 here\n"
+            "• `ripdm= <YouTube URL>` — DM the MP3 to you\n"
+            "Make sure I have Send Messages + Attach Files permissions."
+        )
+        return
+
+    # Allow any other (prefixed) commands you might add later
+    await bot.process_commands(message)
 
 if __name__ == "__main__":
     if not TOKEN:
