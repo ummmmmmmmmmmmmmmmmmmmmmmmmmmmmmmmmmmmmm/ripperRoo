@@ -1,6 +1,7 @@
 # bot.py
-import os, re, tempfile, asyncio, shutil, subprocess
-from typing import Tuple, Optional
+import os, re, tempfile, asyncio, shutil
+from typing import Optional
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
@@ -10,173 +11,163 @@ import yt_dlp
 TOKEN = os.getenv("DISCORD_TOKEN")  # PowerShell: $env:DISCORD_TOKEN='...'
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")  # set if ffmpeg lives elsewhere
 
-# Allow YouTube and SoundCloud (covers subdomains like music.youtube.com, m.soundcloud.com, on.soundcloud.com)
-ALLOWED_DOMAINS = {"youtube.com", "youtu.be", "soundcloud.com"}
+# Where we allow links from
+ALLOWED_DOMAINS = {
+    "youtube.com", "www.youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be",
+    "soundcloud.com", "www.soundcloud.com", "on.soundcloud.com"
+}
 # ===================================================
 
-# Intents (message content required for text commands)
+# Intents (message content needed for text commands)
 intents = discord.Intents.default()
 intents.message_content = True
 
-# Use "*" as the command prefix; we’ll provide our own help command
+# Use "*" as the prefix so users type "*rip <link>" and "*help"
 bot = commands.Bot(command_prefix="*", intents=intents, help_command=None)
 
-# ---- helpers ----
-URL_RE = re.compile(r"(https?://[^\s>]+)", re.IGNORECASE)
-
-def _is_allowed_url(url: str) -> bool:
+# ---------- helpers ----------
+def ok_domain(link: str) -> bool:
     try:
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.split(":", 1)[0].lower()
-        for d in ALLOWED_DOMAINS:
-            if host == d or host.endswith("." + d):
-                return True
-        return False
+        host = urlparse(link).hostname or ""
+        # strip leading "www."
+        if host.startswith("www."):
+            host = host[4:]
+        return host in ALLOWED_DOMAINS
     except Exception:
         return False
 
-def _slugify(name: str) -> str:
-    name = re.sub(r"[^\w\s-]", "", name).strip()
-    name = re.sub(r"[-\s]+", "-", name)
-    return name or "audio"
-
-def _download_mp3(url: str, tempdir: str, kbps: int = 192) -> Tuple[str, str]:
-    ydl_opts = {
+def ydl_opts(tmpdir: str) -> dict:
+    # Save best audio, convert to mp3 via ffmpeg
+    return {
+        "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+        "format": "bestaudio/best",
+        "noprogress": True,
         "quiet": True,
-        "no_warnings": True,
-        "outtmpl": os.path.join(tempdir, "%(id)s.%(ext)s"),
-        "format": "bestaudio/best",   # works for YouTube + SoundCloud
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": str(kbps),
-        }],
-        "noplaylist": True,           # ignore playlists/sets; take a single item
-        "retries": 3,
-        "socket_timeout": 15,
-        "ffmpeg_location": FFMPEG_BIN,  # where yt-dlp finds ffmpeg/ffprobe
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+        ],
+        # If ffmpeg isn't on PATH, point here
+        "ffmpeg_location": FFMPEG_BIN if FFMPEG_BIN else None,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:  # guard against accidental playlists
-            info = info["entries"][0]
-        title = info.get("title", "audio")
-        vid_id = info.get("id")
-        mp3_path = os.path.join(tempdir, f"{vid_id}.mp3")
-        if not os.path.exists(mp3_path):
-            cands = [os.path.join(tempdir, p) for p in os.listdir(tempdir) if p.lower().endswith(".mp3")]
-            if not cands:
-                raise RuntimeError("MP3 not produced (check ffmpeg).")
-            mp3_path = max(cands, key=os.path.getmtime)
-        return mp3_path, title
 
-def _reencode_mp3(src: str, dst: str, bitrate_kbps: int) -> None:
-    subprocess.run(
-        [os.path.join(FFMPEG_BIN, "ffmpeg") if os.name == "nt" else "ffmpeg",
-         "-y", "-i", src, "-b:a", f"{bitrate_kbps}k", dst],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+async def download_to_mp3(link: str, tmpdir: str) -> tuple[str, str]:
+    """
+    Returns (filepath, display_name). Raises on failure.
+    """
+    with yt_dlp.YoutubeDL(ydl_opts(tmpdir)) as ydl:
+        info = ydl.extract_info(link, download=True)
+        # Resolve output path (handles playlists/single items)
+        if "requested_downloads" in info and info["requested_downloads"]:
+            path = info["requested_downloads"][0]["filepath"]
+        else:
+            # fallback: prepare base name and swap to .mp3
+            base = ydl.prepare_filename(info)
+            root, _ = os.path.splitext(base)
+            path = root + ".mp3"
+        title = info.get("title") or "audio"
+        # Normalize to .mp3 extension for sending name
+        if not path.lower().endswith(".mp3"):
+            root, _ = os.path.splitext(path)
+            candidate = root + ".mp3"
+            if os.path.exists(candidate):
+                path = candidate
+        return path, f"{title}.mp3"
+
+async def send_and_cleanup(ctx: commands.Context, file_path: str, file_name: str, to_dm: bool = False):
+    """
+    Sends the file (channel or DM). If successful, attempts to delete the user's command message.
+    """
+    # Actually send the file
+    if to_dm:
+        dm = await ctx.author.create_dm()
+        await dm.send(file=discord.File(file_path, filename=file_name))
+        ack = await ctx.reply("📩 Sent to your DMs.", mention_author=False)
+    else:
+        await ctx.send(file=discord.File(file_path, filename=file_name))
+        ack = None
+
+    # Try to delete the invoking message (requires Manage Messages)
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        # Lacking permission — optionally nudge in a quiet way
+        if ack:
+            try:
+                await ack.edit(content="📩 Sent to your DMs. (I need **Manage Messages** to delete the command here.)")
+            except discord.HTTPException:
+                pass
+    except discord.HTTPException:
+        pass
+
+# ---------- commands ----------
+@bot.command(name="help")
+async def _help(ctx: commands.Context):
+    text = (
+        "**ripperRoo — quick ripper**\n"
+        "• `*rip <link>` — rip YouTube or SoundCloud audio and post it here\n"
+        "• `*ripdm <link>` — rip and DM you the file\n\n"
+        "_Tip: to auto-delete your command after the file sends, make sure my role has **Manage Messages** in this channel._"
     )
+    await ctx.reply(text, mention_author=False)
 
-async def _send_audio(ctx: commands.Context, file_path: str, title: str, to_dm: bool=False):
-    filename = f"{_slugify(title)}.mp3"
-    dest = ctx.author if to_dm else ctx.channel
-    await dest.send(
-        content=f"Here you go: **{title}**" + (" (sent via DM)" if to_dm else ""),
-        file=discord.File(file_path, filename=filename)
-    )
+@bot.command(name="rip")
+async def rip(ctx: commands.Context, link: Optional[str] = None):
+    if not link:
+        return await ctx.reply("Usage: `*rip <link>`", mention_author=False)
+    if not ok_domain(link):
+        return await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
 
+    tmpdir = tempfile.mkdtemp(prefix="rip-")
+    status = await ctx.reply("⏳ Ripping…", mention_author=False)
+    try:
+        path, name = await download_to_mp3(link, tmpdir)
+        await status.edit(content="📤 Uploading…")
+        await send_and_cleanup(ctx, path, name, to_dm=False)
+        # Clean up status message too (optional)
+        try:
+            await status.delete()
+        except discord.HTTPException:
+            pass
+    except Exception as e:
+        try:
+            await status.edit(content=f"❌ Rip failed: `{e}`")
+        except discord.HTTPException:
+            await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+@bot.command(name="ripdm")
+async def ripdm(ctx: commands.Context, link: Optional[str] = None):
+    if not link:
+        return await ctx.reply("Usage: `*ripdm <link>`", mention_author=False)
+    if not ok_domain(link):
+        return await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
+
+    tmpdir = tempfile.mkdtemp(prefix="rip-")
+    status = await ctx.reply("⏳ Ripping…", mention_author=False)
+    try:
+        path, name = await download_to_mp3(link, tmpdir)
+        await status.edit(content="📤 Uploading to DM…")
+        await send_and_cleanup(ctx, path, name, to_dm=True)
+        try:
+            await status.delete()
+        except discord.HTTPException:
+            pass
+    except Exception as e:
+        try:
+            await status.edit(content=f"❌ Rip failed: `{e}`")
+        except discord.HTTPException:
+            await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# ---------- startup ----------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
+    print("Ready.")
 
-# === Commands ===
-@commands.cooldown(1, 20, commands.BucketType.user)
-@bot.command(name="rip")
-async def rip(ctx: commands.Context, url: Optional[str]=None):
-    # If no arg, try to scrape first URL from the message
-    if not url:
-        m = URL_RE.search(ctx.message.content)
-        url = m.group(1) if m else None
-
-    if not url or not _is_allowed_url(url):
-        return await ctx.reply("Give me a valid YouTube or SoundCloud link, e.g. `*rip https://youtu.be/...` or `*rip https://soundcloud.com/...`")
-
-    async with ctx.typing():
-        tempdir = tempfile.mkdtemp(prefix="rip_")
-        try:
-            loop = asyncio.get_event_loop()
-            mp3_path, title = await loop.run_in_executor(None, lambda: _download_mp3(url, tempdir, 192))
-
-            limit = (ctx.guild.filesize_limit if ctx.guild else 8 * 1024 * 1024) or (8 * 1024 * 1024)
-            if os.path.getsize(mp3_path) > limit:
-                for br in (128, 96, 64, 48):
-                    cand = os.path.join(tempdir, f"re_{br}.mp3")
-                    await loop.run_in_executor(None, lambda: _reencode_mp3(mp3_path, cand, br))
-                    if os.path.getsize(cand) < limit:
-                        mp3_path = cand
-                        break
-                else:
-                    mb = limit / (1024*1024)
-                    return await ctx.reply(f"⚠️ File too large for this server (~{mb:.0f} MB). Try `*ripdm <url>`.")
-
-            await _send_audio(ctx, mp3_path, title, to_dm=False)
-        except commands.CommandOnCooldown as c:
-            await ctx.reply(f"⏳ Cooldown: try again in {c.retry_after:.1f}s.")
-        except Exception as e:
-            await ctx.reply(f"❌ Rip failed: `{e}`")
-        finally:
-            try: shutil.rmtree(tempdir)
-            except Exception: pass
-
-@commands.cooldown(1, 20, commands.BucketType.user)
-@bot.command(name="ripdm")
-async def ripdm(ctx: commands.Context, url: Optional[str]=None):
-    if not url:
-        m = URL_RE.search(ctx.message.content)
-        url = m.group(1) if m else None
-    if not url or not _is_allowed_url(url):
-        return await ctx.reply("Give me a valid YouTube or SoundCloud link, e.g. `*ripdm https://youtu.be/...` or `*ripdm https://soundcloud.com/...`")
-
-    async with ctx.typing():
-        tempdir = tempfile.mkdtemp(prefix="rip_")
-        try:
-            loop = asyncio.get_event_loop()
-            mp3_path, title = await loop.run_in_executor(None, lambda: _download_mp3(url, tempdir, 128))
-
-            limit = 8 * 1024 * 1024
-            if os.path.getsize(mp3_path) > limit:
-                for br in (96, 64, 48, 32):
-                    cand = os.path.join(tempdir, f"re_{br}.mp3")
-                    await loop.run_in_executor(None, lambda: _reencode_mp3(mp3_path, cand, br))
-                    if os.path.getsize(cand) < limit:
-                        mp3_path = cand
-                        break
-                else:
-                    return await ctx.reply("⚠️ Still too large to DM. Try a shorter track/video.")
-
-            try: await ctx.author.create_dm()
-            except Exception: pass
-            await _send_audio(ctx, mp3_path, title, to_dm=True)
-        except commands.CommandOnCooldown as c:
-            await ctx.reply(f"⏳ Cooldown: try again in {c.retry_after:.1f}s.")
-        except Exception as e:
-            await ctx.reply(f"❌ Rip failed: `{e}`")
-        finally:
-            try: shutil.rmtree(tempdir)
-            except Exception: pass
-
-@bot.command(name="help")
-async def _help(ctx: commands.Context):
-    await ctx.send(
-        "Usage:\n"
-        "• `*rip <YouTube or SoundCloud URL>` — upload MP3 here\n"
-        "• `*ripdm <YouTube or SoundCloud URL>` — DM the MP3 to you\n"
-        "Notes: I need **Send Messages** and **Attach Files** permissions. "
-        "Large files will be down-bitrated; DM has an 8MB limit."
-    )
-
-# No custom on_message needed now—prefix commands handle everything
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("Set DISCORD_TOKEN env var.")
+        raise SystemExit("Set DISCORD_TOKEN in your environment.")
     bot.run(TOKEN)
