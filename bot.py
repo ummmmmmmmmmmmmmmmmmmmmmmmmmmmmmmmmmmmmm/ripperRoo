@@ -9,7 +9,9 @@ import yt_dlp
 # ===================== Config =====================
 TOKEN = os.getenv("DISCORD_TOKEN")  # PowerShell: $env:DISCORD_TOKEN='...'
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")  # set if ffmpeg lives elsewhere
-ALLOWED_DOMAINS = {"youtube.com", "www.youtube.com", "youtu.be", "music.youtube.com"}
+
+# Allow YouTube and SoundCloud (covers subdomains like music.youtube.com, m.soundcloud.com, on.soundcloud.com)
+ALLOWED_DOMAINS = {"youtube.com", "youtu.be", "soundcloud.com"}
 # ===================================================
 
 # Intents (message content required for custom text commands)
@@ -20,13 +22,16 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=":", intents=intents, help_command=None)
 
 # ---- helpers ----
-YTLINK = re.compile(r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^\s>]+)", re.IGNORECASE)
+URL_RE = re.compile(r"(https?://[^\s>]+)", re.IGNORECASE)
 
 def _is_allowed_url(url: str) -> bool:
     try:
         from urllib.parse import urlparse
-        host = urlparse(url).netloc.lower()
-        return any(host.endswith(d) for d in ALLOWED_DOMAINS)
+        host = urlparse(url).netloc.split(":", 1)[0].lower()
+        for d in ALLOWED_DOMAINS:
+            if host == d or host.endswith("." + d):
+                return True
+        return False
     except Exception:
         return False
 
@@ -40,20 +45,20 @@ def _download_mp3(url: str, tempdir: str, kbps: int = 192) -> Tuple[str, str]:
         "quiet": True,
         "no_warnings": True,
         "outtmpl": os.path.join(tempdir, "%(id)s.%(ext)s"),
-        "format": "bestaudio/best",
+        "format": "bestaudio/best",   # works for YouTube + SoundCloud
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": str(kbps),
         }],
-        "noplaylist": True,
+        "noplaylist": True,           # ignore playlists/sets; take a single item
         "retries": 3,
         "socket_timeout": 15,
-        "ffmpeg_location": FFMPEG_BIN,  # <-- key bit so yt-dlp finds ffmpeg/ffprobe
+        "ffmpeg_location": FFMPEG_BIN,  # where yt-dlp finds ffmpeg/ffprobe
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        if "entries" in info:  # guard against playlists
+        if "entries" in info:  # guard against accidental playlists
             info = info["entries"][0]
         title = info.get("title", "audio")
         vid_id = info.get("id")
@@ -89,10 +94,10 @@ async def on_ready():
 @bot.command(name="rip")
 async def rip(ctx: commands.Context, url: Optional[str]=None):
     if not url:
-        m = YTLINK.search(ctx.message.content)
+        m = URL_RE.search(ctx.message.content)
         url = m.group(1) if m else None
     if not url or not _is_allowed_url(url):
-        return await ctx.reply("Give me a valid YouTube link, e.g. `rip= https://youtu.be/...`")
+        return await ctx.reply("Give me a valid YouTube or SoundCloud link, e.g. `rip= https://youtu.be/...` or `rip= https://soundcloud.com/...`")
 
     async with ctx.typing():
         tempdir = tempfile.mkdtemp(prefix="rip_")
@@ -125,10 +130,10 @@ async def rip(ctx: commands.Context, url: Optional[str]=None):
 @bot.command(name="ripdm")
 async def ripdm(ctx: commands.Context, url: Optional[str]=None):
     if not url:
-        m = YTLINK.search(ctx.message.content)
+        m = URL_RE.search(ctx.message.content)
         url = m.group(1) if m else None
     if not url or not _is_allowed_url(url):
-        return await ctx.reply("Give me a valid YouTube link, e.g. `ripdm= https://youtu.be/...`")
+        return await ctx.reply("Give me a valid YouTube or SoundCloud link, e.g. `ripdm= https://youtu.be/...` or `ripdm= https://soundcloud.com/...`")
 
     async with ctx.typing():
         tempdir = tempfile.mkdtemp(prefix="rip_")
@@ -145,7 +150,7 @@ async def ripdm(ctx: commands.Context, url: Optional[str]=None):
                         mp3_path = cand
                         break
                 else:
-                    return await ctx.reply("⚠️ Still too large to DM. Try a shorter video.")
+                    return await ctx.reply("⚠️ Still too large to DM. Try a shorter track/video.")
 
             try: await ctx.author.create_dm()
             except Exception: pass
@@ -184,8 +189,8 @@ async def on_message(message: discord.Message):
     if content.lower().strip() in {"help", "rip help", "rip=help"}:
         await message.channel.send(
             "Usage:\n"
-            "• `rip= <YouTube URL>` — upload MP3 here\n"
-            "• `ripdm= <YouTube URL>` — DM the MP3 to you\n"
+            "• `rip= <YouTube or SoundCloud URL>` — upload MP3 here\n"
+            "• `ripdm= <YouTube or SoundCloud URL>` — DM the MP3 to you\n"
             "Make sure I have Send Messages + Attach Files permissions."
         )
         return
