@@ -1,6 +1,6 @@
 # bot.py
-import os, re, tempfile, asyncio, shutil, zipfile
-from typing import Optional, Tuple, List
+import os, re, tempfile, asyncio, shutil, zipfile, pathlib
+from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse, parse_qs
 
 import discord
@@ -11,9 +11,7 @@ import yt_dlp
 TOKEN = os.getenv("DISCORD_TOKEN")  # PowerShell: $env:DISCORD_TOKEN='...'
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")
 
-# Per-file upload cap check used to warn before attempting upload (best-effort).
-# NOTE: Discord's real limit depends on server/Nitro. We'll still try to send;
-# if Discord rejects, we catch and report cleanly. You can raise this if your server allows larger.
+# Hint threshold to warn if the final single-zip may exceed your server cap (we still try to upload)
 MAX_FILE_BYTES_HINT = int(os.getenv("MAX_FILE_BYTES_HINT", str(25 * 1024 * 1024)))  # ~25 MiB
 
 ALLOWED_DOMAINS = {
@@ -34,15 +32,32 @@ HELP_TEXT = (
     "_Tip: to auto-delete your command after sending files, give my role **Manage Messages** in this channel._"
 )
 
-# ---------- playlist detection ----------
-def detect_playlist(link: str) -> Tuple[bool, str]:
-    """Returns (is_playlist, provider) where provider in {'youtube','soundcloud','spotify','unknown'}."""
+# ---------- provider utils ----------
+def provider_of(link: str) -> Tuple[str, str]:
+    """Return (ProviderPretty, canonical link to show)."""
     try:
         u = urlparse(link)
         host = (u.hostname or "").lower()
         if host.startswith("www."):
             host = host[4:]
+        if "soundcloud.com" in host:
+            return "SoundCloud", link
+        if host in {"youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be"}:
+            return "YouTube", link
+        if host == "open.spotify.com":
+            return "Spotify", link
+        return "Source", link
+    except Exception:
+        return "Source", link
 
+# ---------- playlist detection ----------
+def detect_playlist(link: str) -> Tuple[bool, str]:
+    """Returns (is_playlist, provider_key) where provider_key in {'youtube','soundcloud','spotify','unknown'}."""
+    try:
+        u = urlparse(link)
+        host = (u.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
         if host in {"youtube.com", "music.youtube.com", "m.youtube.com"}:
             qs = parse_qs(u.query or "")
             if "list" in qs or (u.path or "").startswith("/playlist"):
@@ -51,13 +66,10 @@ def detect_playlist(link: str) -> Tuple[bool, str]:
             qs = parse_qs(u.query or "")
             if "list" in qs:
                 return True, "youtube"
-
         if "soundcloud.com" in host and "/sets/" in (u.path or ""):
             return True, "soundcloud"
-
         if host == "open.spotify.com" and "/playlist/" in (u.path or ""):
             return True, "spotify"
-
         return False, "unknown"
     except Exception:
         return False, "unknown"
@@ -73,13 +85,16 @@ def ok_domain(link: str) -> bool:
         return False
 
 def ydl_opts(tmpdir: str) -> dict:
+    # Write thumbnails and convert to JPG so we can include album art
     return {
         "outtmpl": os.path.join(tmpdir, "%(playlist_index)03d - %(title)s.%(ext)s"),
         "format": "bestaudio/best",
         "noprogress": True,
         "quiet": True,
+        "writethumbnail": True,
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "exec_cmd": None},
         ],
         "ffmpeg_location": FFMPEG_BIN if FFMPEG_BIN else None,
         "yesplaylist": True,
@@ -96,9 +111,26 @@ def _resolve_outpath(ydl: yt_dlp.YoutubeDL, entry: dict, fallback_exts=("mp3","m
             return candidate
     return f"{root}.mp3"
 
-async def download_all_to_mp3(link: str, tmpdir: str) -> Tuple[List[Tuple[str, str]], str, bool]:
-    """Downloads single videos or whole playlists. Returns ([(filepath, display_name)], title, is_playlist)."""
+def _maybe_thumb_path_from_media_path(media_path: str) -> Optional[str]:
+    """Given a downloaded media path, guess the thumbnail .jpg path yt_dlp created."""
+    root, _ = os.path.splitext(media_path)
+    jpg = root + ".jpg"
+    return jpg if os.path.exists(jpg) else None
+
+async def download_all_to_mp3(link: str, tmpdir: str) -> Tuple[List[Tuple[str, str]], str, bool, List[Dict], Optional[str]]:
+    """
+    Downloads single videos or playlists.
+    Returns:
+      items: [(filepath, display_name)]
+      collection_title: str
+      is_playlist: bool
+      meta: [{'index': int|None, 'title': str, 'thumb': Optional[str]}]
+      cover_path: Optional[str]  (best-effort thumbnail to include in zip as cover.jpg)
+    """
     items: List[Tuple[str, str]] = []
+    meta: List[Dict] = []
+    cover_path: Optional[str] = None
+
     with yt_dlp.YoutubeDL(ydl_opts(tmpdir)) as ydl:
         info = ydl.extract_info(link, download=True)
 
@@ -111,27 +143,52 @@ async def download_all_to_mp3(link: str, tmpdir: str) -> Tuple[List[Tuple[str, s
                 track_title = ent.get("title") or "audio"
                 root, _ = os.path.splitext(path)
                 mp3 = root + ".mp3"
-                items.append((mp3 if os.path.exists(mp3) else path, f"{track_title}.mp3"))
-            return items, title, True
+                final_path = mp3 if os.path.exists(mp3) else path
+                items.append((final_path, f"{track_title}.mp3"))
+
+                idx = ent.get("playlist_index")
+                thumb = _maybe_thumb_path_from_media_path(final_path)
+                if not cover_path and thumb:
+                    cover_path = thumb
+                meta.append({"index": idx, "title": track_title, "thumb": thumb})
+            return items, title, True, meta, cover_path
         else:
             title = info.get("title") or "audio"
             path = _resolve_outpath(ydl, info)
             root, _ = os.path.splitext(path)
             mp3 = root + ".mp3"
-            items.append((mp3 if os.path.exists(mp3) else path, f"{title}.mp3"))
-            return items, title, False
+            final_path = mp3 if os.path.exists(mp3) else path
+            items.append((final_path, f"{title}.mp3"))
+
+            thumb = _maybe_thumb_path_from_media_path(final_path)
+            meta.append({"index": None, "title": title, "thumb": thumb})
+            if thumb:
+                cover_path = thumb
+            return items, title, False, meta, cover_path
 
 def _safe_base(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]+', '_', name).strip() or "playlist"
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "playlist"
 
-def make_single_zip(files: List[Tuple[str, str]], out_zip_path: str):
-    """Create one zip at out_zip_path including (path, arcname) pairs."""
+def make_single_zip(files: List[Tuple[str, str]], out_zip_path: str, *, track_meta: List[Dict], cover_path: Optional[str]):
+    """Create one zip at out_zip_path, including tracks, tracklist.txt, and optional cover.jpg."""
+    tracklist_txt = "\n".join(
+        [f"{(m.get('index') if m.get('index') is not None else 1+i):02d}. {m.get('title','')}"
+         for i, m in enumerate(sorted(track_meta, key=lambda x: (x.get('index') is None, x.get('index') or (i+1)))) ]
+    )
+
     with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # tracks
         for p, display_name in files:
             try:
                 zf.write(p, arcname=display_name)
             except FileNotFoundError:
                 continue
+        # tracklist
+        zf.writestr("tracklist.txt", tracklist_txt)
+        # cover image if available
+        if cover_path and os.path.exists(cover_path):
+            ext = pathlib.Path(cover_path).suffix.lower()
+            zf.write(cover_path, arcname=f"cover{ext}")
 
 async def send_single_file_with_banner(
     ctx: commands.Context,
@@ -140,16 +197,9 @@ async def send_single_file_with_banner(
     *,
     to_dm: bool,
     attribution: Optional[str],
-    trailing_text: Optional[str] = None,
 ):
-    """Sends exactly one attachment with optional banner + trailing text (e.g., source link)."""
-    parts = []
-    if ctx.guild and attribution:
-        parts.append(attribution)
-    if trailing_text:
-        parts.append(trailing_text)
-    content = "\n".join(parts) if parts else None
-
+    """Send exactly one attachment with optional attribution line."""
+    content = attribution if attribution else None
     try:
         if to_dm:
             dm = await ctx.author.create_dm()
@@ -157,14 +207,14 @@ async def send_single_file_with_banner(
         else:
             await ctx.send(content=content, file=discord.File(filepath, filename=filename))
     except discord.HTTPException as e:
-        # Report cleanly that single-zip upload failed (likely size cap)
+        # Friendly size hint
         hint = ""
         try:
             size = os.path.getsize(filepath)
             hint = f" (size ~{size/1024/1024:.1f} MiB; server cap may be lower)"
         except Exception:
             pass
-        await ctx.reply(f"❌ Failed to upload single zip{hint}. Discord likely rejected it due to file size limits.", mention_author=False)
+        await ctx.reply(f"❌ Failed to upload file{hint}. Discord likely rejected it due to file size limits.", mention_author=False)
         raise e
 
 async def delete_invoke_safely(ctx: commands.Context):
@@ -255,6 +305,16 @@ async def maybe_confirm_playlist(ctx: commands.Context, link: str) -> Tuple[bool
             pass
         return False, provider, prompt
 
+def build_attribution(ctx: commands.Context, link: str) -> Optional[str]:
+    """Server-only: 'ripped by: Display(Name)(Username) from [Provider](link)'."""
+    if ctx.guild is None:
+        return None
+    display = ctx.author.display_name
+    uname = ctx.author.name
+    provider_pretty, canonical = provider_of(link)
+    # Markdown masked link; Discord will render it clickable
+    return f"ripped by: {display}({uname}) from [{provider_pretty}]({canonical})"
+
 @bot.command(name="rip")
 async def rip(ctx: commands.Context, link: Optional[str] = None):
     if not link:
@@ -272,14 +332,14 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     status = await ctx.reply("⏳ Ripping…", mention_author=False)
     try:
-        items, title, is_pl = await download_all_to_mp3(link, tmpdir)
+        items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir)
         if is_pl:
             await status.edit(content=f"🗜️ Zipping… ({len(items)} track{'s' if len(items)!=1 else ''})")
             safe = _safe_base(title)
             zip_path = os.path.join(tmpdir, f"{safe}.zip")
-            make_single_zip(items, zip_path)
+            make_single_zip(items, zip_path, track_meta=meta, cover_path=cover)
 
-            # Optional: warn if obviously larger than common caps (we'll still try)
+            # If big, warn (we still attempt upload)
             try:
                 if os.path.getsize(zip_path) > MAX_FILE_BYTES_HINT:
                     await status.edit(content="🗜️ Zipping… (note: zip may exceed this server's upload cap)")
@@ -287,14 +347,13 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
                 pass
 
             await status.edit(content=f"📤 Uploading zip…")
-            attribution = f"ripped by: {ctx.author.display_name}({ctx.author.name})" if ctx.guild else None
-            trailing = link  # raw URL so Discord embeds
+            attribution = build_attribution(ctx, link)
             await send_single_file_with_banner(
                 ctx, zip_path, os.path.basename(zip_path),
-                to_dm=False, attribution=attribution, trailing_text=trailing
+                to_dm=False, attribution=attribution
             )
 
-            # Delete the confirmation prompt (after upload)
+            # Delete playlist confirmation prompt after upload
             if prompt_msg:
                 try:
                     await prompt_msg.delete()
@@ -302,11 +361,11 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
                     pass
             await delete_invoke_safely(ctx)
         else:
-            # Single item: send the audio as-is
+            # Single item: send audio + attribution with clickable provider word
             await status.edit(content="📤 Uploading…")
-            attribution = f"ripped by: {ctx.author.display_name}({ctx.author.name})" if ctx.guild else None
+            attribution = build_attribution(ctx, link)
             (p, n) = items[0]
-            await send_single_file_with_banner(ctx, p, n, to_dm=False, attribution=attribution, trailing_text=None)
+            await send_single_file_with_banner(ctx, p, n, to_dm=False, attribution=attribution)
             await delete_invoke_safely(ctx)
 
         try:
@@ -338,18 +397,18 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     status = await ctx.reply("⏳ Ripping…", mention_author=False)
     try:
-        items, title, is_pl = await download_all_to_mp3(link, tmpdir)
+        items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir)
         if is_pl:
             await status.edit(content=f"🗜️ Zipping… ({len(items)} track{'s' if len(items)!=1 else ''})")
             safe = _safe_base(title)
             zip_path = os.path.join(tmpdir, f"{safe}.zip")
-            make_single_zip(items, zip_path)
+            make_single_zip(items, zip_path, track_meta=meta, cover_path=cover)
 
             await status.edit(content=f"📤 Uploading to DM…")
-            # DMs: no attribution banner; still include source link
+            # DMs: no server attribution. We still keep the file clean (tracklist & cover inside zip).
             await send_single_file_with_banner(
                 ctx, zip_path, os.path.basename(zip_path),
-                to_dm=True, attribution=None, trailing_text=link
+                to_dm=True, attribution=None
             )
 
             if prompt_msg:
@@ -361,7 +420,7 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
         else:
             await status.edit(content="📤 Uploading to DM…")
             (p, n) = items[0]
-            await send_single_file_with_banner(ctx, p, n, to_dm=True, attribution=None, trailing_text=None)
+            await send_single_file_with_banner(ctx, p, n, to_dm=True, attribution=None)
             await delete_invoke_safely(ctx)
 
         try:
