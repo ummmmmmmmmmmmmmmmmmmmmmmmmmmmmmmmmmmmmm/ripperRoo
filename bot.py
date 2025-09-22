@@ -116,7 +116,6 @@ class ProgressReporter:
 
     def _music_bar(self) -> str:
         filled = clamp(int(round(self.percent/100 * self.bar_width)), 0, self.bar_width)
-        # Randomize glyphs each update so it "shimmers"
         notes = "".join(random.choice(NOTE_GLYPHS) for _ in range(filled))
         rest  = "-" * (self.bar_width - filled)
         return f"[{notes}{rest}]"
@@ -124,7 +123,7 @@ class ProgressReporter:
     async def update(self, force: bool=False):
         if not self.msg: return
         now = time.time()
-        if not force and now - self._last_edit < 0.45:  # throttle to avoid rate limits
+        if not force and now - self._last_edit < 0.45:
             return
         self._last_edit = now
 
@@ -152,7 +151,7 @@ class ProgressReporter:
             except discord.HTTPException: pass
 
 # ---------- yt_dlp helpers ----------
-def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter) -> dict:
+def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter, loop: asyncio.AbstractEventLoop) -> dict:
     pp = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
     opts = {
         "outtmpl": os.path.join(tmpdir, "%(playlist_index)03d - %(title)s.%(ext)s"),
@@ -161,7 +160,7 @@ def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter) -> dict:
         "quiet": True,
         "ffmpeg_location": FFMPEG_BIN if FFMPEG_BIN else None,
         "yesplaylist": True,
-        "progress_hooks": [make_hook(pr)],
+        "progress_hooks": [make_hook(pr, loop)],
     }
     if include_thumbs:
         opts["writethumbnail"] = True
@@ -169,8 +168,8 @@ def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter) -> dict:
     opts["postprocessors"] = pp
     return opts
 
-def make_hook(pr: ProgressReporter):
-    loop = asyncio.get_event_loop()
+def make_hook(pr: ProgressReporter, loop: asyncio.AbstractEventLoop):
+    # 'loop' is captured from the MAIN thread where it exists; safe to call from worker thread.
     def hook(d):
         try:
             if d.get("status") in ("downloading","finished"):
@@ -186,7 +185,7 @@ def make_hook(pr: ProgressReporter):
                 if pr.t_bytes:
                     pr.percent = clamp(int(pr.d_bytes * 100 / pr.t_bytes), 0, 100)
                 else:
-                    pr.percent = min(99, pr.percent + 1)  # rough fallback
+                    pr.percent = min(99, pr.percent + 1)
 
                 if d.get("status") == "finished":
                     pr.percent = 100
@@ -226,10 +225,13 @@ async def probe_playlist_count(link: str) -> Optional[int]:
 
 async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool, pr: ProgressReporter) -> Tuple[List[Tuple[str,str]], str, bool, List[Dict], Optional[str]]:
     """Run yt_dlp in a worker thread so our progress bar can update live."""
+    main_loop = asyncio.get_running_loop()
+
     def do_download():
-        with yt_dlp.YoutubeDL(ydl_opts(tmpdir, include_thumbs, pr)) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts(tmpdir, include_thumbs, pr, main_loop)) as ydl:
             info = ydl.extract_info(link, download=True)
             return info, ydl
+
     info, ydl = await asyncio.to_thread(do_download)
 
     items: List[Tuple[str,str]] = []
@@ -345,26 +347,47 @@ async def _help(ctx: commands.Context):
     await countdown_delete_message(msg, 5)
     await delete_invoke_safely(ctx)
 
-async def maybe_notify_zip(ctx: commands.Context, link: str) -> None:
+async def maybe_notify_zip(ctx: commands.Context, link: str) -> Tuple[bool, Optional[int]]:
+    """
+    If playlist length > 5, show a 5s 'will be zipped' notice then delete it.
+    Returns (big_zip, count_or_None).
+    """
     is_pl, provider = detect_playlist(link)
-    if not is_pl: return
+    if not is_pl: return False, None
     if provider == "spotify":
         warn = await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False)
         await countdown_delete_message(warn, 5)
-        return
+        return False, None
     count = await probe_playlist_count(link)
     if count is not None and count > 5:
         prov = "YouTube" if provider == "youtube" else ("SoundCloud" if provider == "soundcloud" else "Bandcamp")
         note = await ctx.reply(f"⚠️ Detected a **{prov}** playlist with **{count} tracks**.\nIt exceeds 5 tracks, so I’ll **zip** the audio.", mention_author=False)
         await countdown_delete_message(note, 5)
+        return True, count
+    return False, count
 
-async def ask_artwork(ctx: commands.Context) -> Tuple[bool, Optional[discord.Message]]:
+async def ask_artwork(ctx: commands.Context, *, big_zip: bool) -> Tuple[bool, Optional[discord.Message]]:
+    """
+    Ask once per rip whether to include Artwork.
+    If big_zip=True (playlist >5): wording becomes "include the Artwork in the .zip?"
+    """
     view = ArtChoiceView(ctx.author.id, timeout=30)
-    prompt = await ctx.reply("Do you want to include **Artwork**? (If yes, I’ll ZIP audio + artwork together.)", view=view, mention_author=False)
+    prompt_text = (
+        "This source exceeds **5 tracks** and will be **zipped**.\n"
+        "Would you like to include the **Artwork** in the **.zip**?"
+        if big_zip else
+        "Do you want to include **Artwork**? (If yes, I’ll ZIP audio + artwork together.)"
+    )
+    prompt = await ctx.reply(prompt_text, view=view, mention_author=False)
     await view.wait()
     include = bool(view.include_art)
-    try: await prompt.edit(content=("🖼️ Artwork will be included." if include else "🎵 Audio only."), view=None)
-    except discord.HTTPException: pass
+    try:
+        await prompt.edit(
+            content=("🖼️ Artwork will be included." if include else "🎵 Audio only."),
+            view=None
+        )
+    except discord.HTTPException:
+        pass
     return include, prompt
 
 @bot.command(name="rip")
@@ -377,8 +400,8 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
             warn = await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False); await countdown_delete_message(warn, 5); return
         msg = await ctx.reply("Unsupported link. Try YouTube, SoundCloud, or Bandcamp.", mention_author=False); await countdown_delete_message(msg, 5); return
 
-    await maybe_notify_zip(ctx, link)
-    include_art, art_prompt = await ask_artwork(ctx)
+    big_zip, _ = await maybe_notify_zip(ctx, link)
+    include_art, art_prompt = await ask_artwork(ctx, big_zip=big_zip)
 
     pr = ProgressReporter(ctx); await pr.start()
     est_count = await probe_playlist_count(link)
@@ -445,8 +468,8 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
             warn = await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False); await countdown_delete_message(warn, 5); return
         msg = await ctx.reply("Unsupported link. Try YouTube, SoundCloud, or Bandcamp.", mention_author=False); await countdown_delete_message(msg, 5); return
 
-    await maybe_notify_zip(ctx, link)
-    include_art, art_prompt = await ask_artwork(ctx)
+    big_zip, _ = await maybe_notify_zip(ctx, link)
+    include_art, art_prompt = await ask_artwork(ctx, big_zip=big_zip)
 
     pr = ProgressReporter(ctx); await pr.start()
     est_count = await probe_playlist_count(link)
