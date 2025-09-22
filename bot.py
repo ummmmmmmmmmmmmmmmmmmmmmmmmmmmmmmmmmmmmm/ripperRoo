@@ -1,4 +1,4 @@
-# bot.py (slash-only, reliable sync)
+# bot.py — pure slash client (discord.Client + app_commands.CommandTree)
 import os, re, stat, time, random, zipfile, shutil, tempfile, asyncio, pathlib, datetime as dt
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse, parse_qs
@@ -6,22 +6,16 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 import yt_dlp
 
 # ========= Config =========
 TOKEN = os.getenv("DISCORD_TOKEN")  # set in your environment
-
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")
 MAX_FILE_BYTES_HINT = int(os.getenv("MAX_FILE_BYTES_HINT", str(25 * 1024 * 1024)))  # e.g., 25 MiB
 
-# OPTIONAL: put your test guild IDs here for INSTANT command availability.
-# Example: APP_GUILD_IDS = [123456789012345678, 234567890123456789]
-APP_GUILD_IDS: List[int] = []  # leave [] to register globally (may take up to an hour the first time)
+# OPTIONAL: fill with your server IDs for INSTANT command availability
+APP_GUILD_IDS: List[int] = []  # example: [123456789012345678]
 # =========================
-
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)  # prefix unused (slash-only)
 
 HELP_TEXT = (
     "**ripperRoo — a Discord mp3 ripper created by d-rod**\n"
@@ -32,15 +26,18 @@ HELP_TEXT = (
     "• `/sync` — owner-only; re-sync slash commands in this server\n"
 )
 
-# Active rip per user id
+# One active rip per user id
 ACTIVE_RIPS: Dict[int, Dict] = {}
 
-# ---------- utils ----------
+# ---------- small utils ----------
 def human_mb(n: Optional[float]) -> str:
     try: return f"{(n or 0)/1024/1024:.1f} MB"
     except Exception: return "0 MB"
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
+
+def _safe_base(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "playlist"
 
 def provider_of(link: str) -> Tuple[str, str]:
     try:
@@ -78,8 +75,12 @@ def ok_domain(link: str) -> bool:
     except Exception:
         return False
 
-def _safe_base(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "playlist"
+def build_attribution(inter: discord.Interaction, link: str) -> Optional[str]:
+    if inter.guild is None: return None
+    disp = inter.user.display_name
+    uname = inter.user.name
+    provider, url = provider_of(link)
+    return f"ripped by: {disp}({uname}) from [{provider}]({url})"
 
 # ---------- startup temp cleanup ----------
 def _safe_rmtree(p: Path):
@@ -112,7 +113,7 @@ async def eph_send(inter: discord.Interaction, content: str = "\u200b", *,
     else:
         return await inter.followup.send(content=content, view=view, ephemeral=True, wait=True)
 
-# ---------- progress bar ----------
+# ---------- progress bar (music notes) ----------
 NOTE_GLYPHS = ["𝆕","𝅘𝅥","𝅗𝅥","𝅘𝅥𝅮","♩","♪","♫","♬"]
 
 class ProgressReporter:
@@ -159,7 +160,7 @@ class ProgressReporter:
             try: await self.msg.edit(content=text)
             except discord.HTTPException: pass
 
-# ---------- yt-dlp helpers ----------
+# ---------- yt-dlp plumbing ----------
 class CaptureLogger:
     def __init__(self):
         self.errors: List[str] = []; self.warnings: List[str] = []
@@ -304,13 +305,7 @@ def pack_into_zip_parts(base_name: str, tmpdir: str, files: List[Tuple[str,str]]
 def make_single_zip(files: List[Tuple[str,str]], out_zip: str, *, track_meta: List[Dict], cover_path: Optional[str]):
     make_zip(out_zip, files, track_meta=track_meta, cover_path=cover_path, include_cover=True)
 
-def build_attribution(inter: discord.Interaction, link: str) -> Optional[str]:
-    if inter.guild is None: return None
-    disp = inter.user.display_name; uname = inter.user.name
-    provider, url = provider_of(link)
-    return f"ripped by: {disp}({uname}) from [{provider}]({url})"
-
-# ---------- views ----------
+# ---------- Views (Artwork / Geo / Abort) ----------
 class ArtChoiceView(discord.ui.View):
     def __init__(self, author_id: int, *, timeout: float = 30.0):
         super().__init__(timeout=timeout); self.author_id = author_id; self.include_art: Optional[bool] = None
@@ -359,37 +354,39 @@ class AbortConfirmView(discord.ui.View):
         self.confirmed = False; [setattr(c,"disabled",True) for c in self.children]
         await itx.response.edit_message(content="Abort cancelled.", view=self); self.stop()
 
-# ---------- events & sync ----------
-def _guild_objs():
+# ---------- Client / Tree ----------
+intents = discord.Intents.default()  # no message_content needed
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+def guild_objs() -> List[discord.Object]:
     return [discord.Object(id=i) for i in APP_GUILD_IDS]
 
-@bot.event
+async def sync_all():
+    if APP_GUILD_IDS:
+        for gid in APP_GUILD_IDS:
+            await tree.sync(guild=discord.Object(id=gid))
+        print(f"Slash commands synced to guilds: {APP_GUILD_IDS}")
+    else:
+        synced = await tree.sync()
+        print(f"Global slash commands synced: {len(synced)}")
+
+@client.event
 async def on_ready():
     try: clean_stale_tmp()
     except Exception: pass
-
-    try:
-        if APP_GUILD_IDS:
-            for gid in APP_GUILD_IDS:
-                await bot.tree.sync(guild=discord.Object(id=gid))
-            print(f"Slash commands synced to guilds: {APP_GUILD_IDS}")
-        else:
-            synced = await bot.tree.sync()
-            print(f"Global slash commands synced: {len(synced)}")
-    except Exception as e:
-        print(f"Slash sync error: {e}")
-
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    try: await sync_all()
+    except Exception as e: print(f"Slash sync error: {e}")
+    print(f"Logged in as {client.user} (id={client.user.id})")
     print("Ready.")
 
-@bot.event
+@client.event
 async def on_guild_join(guild: discord.Guild):
     try:
-        await bot.tree.sync(guild=guild)
+        await tree.sync(guild=guild)
         print(f"Synced commands for new guild: {guild.id}")
     except Exception as e:
         print(f"Guild sync error ({guild.id}): {e}")
-
     chan = guild.system_channel
     if not chan or not chan.permissions_for(guild.me).send_messages:
         for c in guild.text_channels:
@@ -398,41 +395,7 @@ async def on_guild_join(guild: discord.Guild):
         try: await chan.send("Thanks for adding me! Use `/help` for commands.")
         except discord.HTTPException: pass
 
-# ---------- command plumbing (guild scoping wrapper) ----------
-def guild_scope(func):
-    """Apply per-guild registration when APP_GUILD_IDS is set."""
-    return app_commands.guilds(*_guild_objs())(func) if APP_GUILD_IDS else func
-
-# ---------- /help ----------
-@guild_scope
-@bot.tree.command(name="help", description="Show commands")
-async def help_cmd(inter: discord.Interaction):
-    await eph_send(inter, HELP_TEXT)
-
-# ---------- /abort ----------
-@guild_scope
-@bot.tree.command(name="abort", description="Abort your current rip")
-async def abort_cmd(inter: discord.Interaction):
-    job = ACTIVE_RIPS.get(inter.user.id)
-    if not job:
-        await eph_send(inter, "You don't have an active rip.")
-        return
-
-    view = AbortConfirmView(inter.user.id)
-    confirm_msg = await eph_send(inter, "Download currently in process, are you SURE? [Y/N]", view=view)
-    await view.wait()
-    try: await confirm_msg.edit(view=None)
-    except discord.HTTPException: pass
-
-    if not view.confirmed:
-        await eph_send(inter, "Abort cancelled.")
-        return
-
-    # Confirmed: cancel immediately
-    pr: ProgressReporter = job["pr"]; pr.cancelled = True
-    await eph_send(inter, "Aborted.")
-
-# ---------- core helpers ----------
+# ---------- helpers used in flow ----------
 async def maybe_notify_zip(inter: discord.Interaction, link: str) -> Tuple[bool, Optional[int]]:
     is_pl, provider = detect_playlist(link)
     if not is_pl: return False, None
@@ -457,7 +420,7 @@ async def ask_artwork(inter: discord.Interaction, *, big_zip: bool) -> bool:
 def user_has_active(uid: int) -> bool: return uid in ACTIVE_RIPS
 def clear_active(uid: int): ACTIVE_RIPS.pop(uid, None)
 
-# ---------- main ripping flow ----------
+# ---------- ripping flow ----------
 async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
     big_zip, _ = await maybe_notify_zip(inter, link)
     include_art = await ask_artwork(inter, big_zip=big_zip)
@@ -472,7 +435,9 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
     try:
         items, title, is_pl, meta, cover, caplog = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art, pr=pr)
 
-        geo_lines = [ln for ln in (caplog.errors + caplog.warnings) if "geo" in ln.lower() or "available from your location" in ln.lower()]
+        # Geo-restriction handling
+        geo_lines = [ln for ln in (caplog.errors + caplog.warnings)
+                     if "geo" in ln.lower() or "available from your location" in ln.lower()]
         skipped = sum(1 for m in meta if not m.get("title"))
         if geo_lines and is_pl and skipped > 0 and not pr.cancelled:
             v = GeoDecisionView(inter.user.id)
@@ -492,6 +457,7 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
         await pr.replace("Preparing files…")
         attribution = build_attribution(inter, link)
 
+        # Upload decisions
         if include_art:
             safe = _safe_base(title); zip_path = os.path.join(tmpdir, f"{safe}.zip")
             make_single_zip(items, zip_path, track_meta=meta, cover_path=cover)
@@ -509,11 +475,11 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
             except discord.HTTPException:
                 await pr.replace("Zip too large. Splitting into parts…")
                 parts = pack_into_zip_parts(_safe_base(safe), tmpdir, items, track_meta=meta, cover_path=cover, size_limit=MAX_FILE_BYTES_HINT)
-                files_payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
+                payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
                 if to_dm:
-                    dm = await inter.user.create_dm(); await dm.send(content=attribution, files=files_payload)
+                    dm = await inter.user.create_dm(); await dm.send(content=attribution, files=payload)
                 else:
-                    await inter.channel.send(content=attribution, files=files_payload)
+                    await inter.channel.send(content=attribution, files=payload)
         else:
             if is_pl and len(items) > 5:
                 safe = _safe_base(title); zip_path = os.path.join(tmpdir, f"{safe}.zip")
@@ -528,11 +494,11 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
                 except discord.HTTPException:
                     await pr.replace("Zip too large. Splitting into parts…")
                     parts = pack_into_zip_parts(_safe_base(safe), tmpdir, items, track_meta=meta, cover_path=None, size_limit=MAX_FILE_BYTES_HINT)
-                    files_payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
+                    payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
                     if to_dm:
-                        dm = await inter.user.create_dm(); await dm.send(content=attribution, files=files_payload)
+                        dm = await inter.user.create_dm(); await dm.send(content=attribution, files=payload)
                     else:
-                        await inter.channel.send(content=attribution, files=files_payload)
+                        await inter.channel.send(content=attribution, files=payload)
             else:
                 await pr.replace("Uploading…")
                 if len(items) == 1:
@@ -570,9 +536,36 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
         clear_active(inter.user.id)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ---------- /rip ----------
-@guild_scope
-@bot.tree.command(name="rip", description="Rip audio and post to this channel")
+# ---------- Slash Commands ----------
+def scope_decorator():
+    return app_commands.guilds(*guild_objs()) if APP_GUILD_IDS else (lambda f: f)
+
+@scope_decorator()
+@tree.command(name="help", description="Show commands")
+async def help_cmd(inter: discord.Interaction):
+    await eph_send(inter, HELP_TEXT)
+
+@scope_decorator()
+@tree.command(name="abort", description="Abort your current rip")
+async def abort_cmd(inter: discord.Interaction):
+    job = ACTIVE_RIPS.get(inter.user.id)
+    if not job:
+        await eph_send(inter, "You don't have an active rip.")
+        return
+    view = AbortConfirmView(inter.user.id)
+    confirm = await eph_send(inter, "Download currently in process, are you SURE? [Y/N]", view=view)
+    await view.wait()
+    try: await confirm.edit(view=None)
+    except discord.HTTPException: pass
+    if not view.confirmed:
+        await eph_send(inter, "Abort cancelled.")
+        return
+    pr: ProgressReporter = job["pr"]
+    pr.cancelled = True
+    await eph_send(inter, "Aborted.")
+
+@scope_decorator()
+@tree.command(name="rip", description="Rip audio and post to this channel")
 @app_commands.describe(link="YouTube / SoundCloud / Bandcamp link")
 async def rip_cmd(inter: discord.Interaction, link: str):
     if not ok_domain(link):
@@ -585,9 +578,8 @@ async def rip_cmd(inter: discord.Interaction, link: str):
     await inter.response.defer(ephemeral=True)
     await run_rip(inter, link, to_dm=False)
 
-# ---------- /ripdm ----------
-@guild_scope
-@bot.tree.command(name="ripdm", description="Rip audio and DM it to you")
+@scope_decorator()
+@tree.command(name="ripdm", description="Rip audio and DM it to you")
 @app_commands.describe(link="YouTube / SoundCloud / Bandcamp link")
 async def ripdm_cmd(inter: discord.Interaction, link: str):
     if not ok_domain(link):
@@ -600,17 +592,16 @@ async def ripdm_cmd(inter: discord.Interaction, link: str):
     await inter.response.defer(ephemeral=True)
     await run_rip(inter, link, to_dm=True)
 
-# ---------- /sync (owner only) ----------
-@guild_scope
-@bot.tree.command(name="sync", description="(Owner) Force re-sync of slash commands here")
+@scope_decorator()
+@tree.command(name="sync", description="(Owner) Force re-sync of slash commands here")
 async def sync_here(inter: discord.Interaction):
-    app = await bot.application_info()
+    app = await client.application_info()
     if inter.user.id != app.owner.id:
         await inter.response.send_message("Only the bot owner can run this.", ephemeral=True)
         return
     await inter.response.defer(ephemeral=True)
     try:
-        res = await bot.tree.sync(guild=inter.guild)
+        res = await tree.sync(guild=inter.guild)
         await inter.followup.send(f"Synced {len(res)} command(s) to this guild.", ephemeral=True)
     except Exception as e:
         await inter.followup.send(f"Sync failed: `{e}`", ephemeral=True)
@@ -619,4 +610,4 @@ async def sync_here(inter: discord.Interaction):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in your environment.")
-    bot.run(TOKEN)
+    client.run(TOKEN)
