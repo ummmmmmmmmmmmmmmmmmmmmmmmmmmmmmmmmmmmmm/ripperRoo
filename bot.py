@@ -1,4 +1,4 @@
-# bot.py (slash-only)
+# bot.py (slash-only, reliable sync)
 import os, re, stat, time, random, zipfile, shutil, tempfile, asyncio, pathlib, datetime as dt
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse, parse_qs
@@ -9,27 +9,33 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-# ======= Config =======
-TOKEN = os.getenv("DISCORD_TOKEN")              # set this in your environment
+# ========= Config =========
+TOKEN = os.getenv("DISCORD_TOKEN")  # set in your environment
+
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")
 MAX_FILE_BYTES_HINT = int(os.getenv("MAX_FILE_BYTES_HINT", str(25 * 1024 * 1024)))  # e.g., 25 MiB
-# ======================
 
-intents = discord.Intents.default()  # no text-prefix commands
-bot = commands.Bot(command_prefix="!", intents=intents)  # prefix unused; all commands are slash-only
+# OPTIONAL: put your test guild IDs here for INSTANT command availability.
+# Example: APP_GUILD_IDS = [123456789012345678, 234567890123456789]
+APP_GUILD_IDS: List[int] = []  # leave [] to register globally (may take up to an hour the first time)
+# =========================
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)  # prefix unused (slash-only)
 
 HELP_TEXT = (
     "**ripperRoo — a Discord mp3 ripper created by d-rod**\n"
     "• `/rip <link>` — rip YouTube, SoundCloud, or Bandcamp audio and post it here\n"
     "• `/ripdm <link>` — rip and DM you the file\n"
-    "• `/abort` — abort **your** current rip\n\n"
-    "_Tip: to auto-delete your command after sending files, give my role **Manage Messages** in this channel._"
+    "• `/abort` — abort **your** current rip\n"
+    "• `/help` — show this help\n"
+    "• `/sync` — owner-only; re-sync slash commands in this server\n"
 )
 
-# Active rips by user id (per guild/channel)
+# Active rip per user id
 ACTIVE_RIPS: Dict[int, Dict] = {}
 
-# ---------- util ----------
+# ---------- utils ----------
 def human_mb(n: Optional[float]) -> str:
     try: return f"{(n or 0)/1024/1024:.1f} MB"
     except Exception: return "0 MB"
@@ -96,9 +102,10 @@ def clean_stale_tmp(prefix: str = "rip-", max_age_hours: int = 36):
         except Exception:
             pass
 
-# ---------- ephemeral helpers ----------
-async def eph_send(inter: discord.Interaction, content: str = "\u200b", *, view: discord.ui.View | None = None) -> discord.Message:
-    """Send or follow up with an ephemeral message, return the message so we can edit it later."""
+# ---------- ephemeral helper ----------
+async def eph_send(inter: discord.Interaction, content: str = "\u200b", *,
+                   view: discord.ui.View | None = None) -> discord.Message:
+    """Send or follow up with an ephemeral message and return it so we can edit later."""
     if not inter.response.is_done():
         await inter.response.send_message(content=content, view=view, ephemeral=True)
         return await inter.original_response()
@@ -152,7 +159,7 @@ class ProgressReporter:
             try: await self.msg.edit(content=text)
             except discord.HTTPException: pass
 
-# ---------- yt-dlp ----------
+# ---------- yt-dlp helpers ----------
 class CaptureLogger:
     def __init__(self):
         self.errors: List[str] = []; self.warnings: List[str] = []
@@ -352,27 +359,78 @@ class AbortConfirmView(discord.ui.View):
         self.confirmed = False; [setattr(c,"disabled",True) for c in self.children]
         await itx.response.edit_message(content="Abort cancelled.", view=self); self.stop()
 
-# ---------- events ----------
+# ---------- events & sync ----------
+def _guild_objs():
+    return [discord.Object(id=i) for i in APP_GUILD_IDS]
+
 @bot.event
 async def on_ready():
     try: clean_stale_tmp()
     except Exception: pass
-    try: await bot.tree.sync()
-    except Exception as e: print(f"Slash sync error: {e}")
+
+    try:
+        if APP_GUILD_IDS:
+            for gid in APP_GUILD_IDS:
+                await bot.tree.sync(guild=discord.Object(id=gid))
+            print(f"Slash commands synced to guilds: {APP_GUILD_IDS}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Global slash commands synced: {len(synced)}")
+    except Exception as e:
+        print(f"Slash sync error: {e}")
+
     print(f"Logged in as {bot.user} (id={bot.user.id})")
     print("Ready.")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    chan = None
-    if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
-        chan = guild.system_channel
-    else:
+    try:
+        await bot.tree.sync(guild=guild)
+        print(f"Synced commands for new guild: {guild.id}")
+    except Exception as e:
+        print(f"Guild sync error ({guild.id}): {e}")
+
+    chan = guild.system_channel
+    if not chan or not chan.permissions_for(guild.me).send_messages:
         for c in guild.text_channels:
             if c.permissions_for(guild.me).send_messages: chan = c; break
     if chan:
         try: await chan.send("Thanks for adding me! Use `/help` for commands.")
         except discord.HTTPException: pass
+
+# ---------- command plumbing (guild scoping wrapper) ----------
+def guild_scope(func):
+    """Apply per-guild registration when APP_GUILD_IDS is set."""
+    return app_commands.guilds(*_guild_objs())(func) if APP_GUILD_IDS else func
+
+# ---------- /help ----------
+@guild_scope
+@bot.tree.command(name="help", description="Show commands")
+async def help_cmd(inter: discord.Interaction):
+    await eph_send(inter, HELP_TEXT)
+
+# ---------- /abort ----------
+@guild_scope
+@bot.tree.command(name="abort", description="Abort your current rip")
+async def abort_cmd(inter: discord.Interaction):
+    job = ACTIVE_RIPS.get(inter.user.id)
+    if not job:
+        await eph_send(inter, "You don't have an active rip.")
+        return
+
+    view = AbortConfirmView(inter.user.id)
+    confirm_msg = await eph_send(inter, "Download currently in process, are you SURE? [Y/N]", view=view)
+    await view.wait()
+    try: await confirm_msg.edit(view=None)
+    except discord.HTTPException: pass
+
+    if not view.confirmed:
+        await eph_send(inter, "Abort cancelled.")
+        return
+
+    # Confirmed: cancel immediately
+    pr: ProgressReporter = job["pr"]; pr.cancelled = True
+    await eph_send(inter, "Aborted.")
 
 # ---------- core helpers ----------
 async def maybe_notify_zip(inter: discord.Interaction, link: str) -> Tuple[bool, Optional[int]]:
@@ -399,34 +457,7 @@ async def ask_artwork(inter: discord.Interaction, *, big_zip: bool) -> bool:
 def user_has_active(uid: int) -> bool: return uid in ACTIVE_RIPS
 def clear_active(uid: int): ACTIVE_RIPS.pop(uid, None)
 
-# ---------- slash: help ----------
-@bot.tree.command(name="help", description="Show commands")
-async def help_cmd(inter: discord.Interaction):
-    await eph_send(inter, HELP_TEXT)
-
-# ---------- slash: abort ----------
-@bot.tree.command(name="abort", description="Abort your current rip")
-async def abort_cmd(inter: discord.Interaction):
-    job = ACTIVE_RIPS.get(inter.user.id)
-    if not job:
-        await eph_send(inter, "You don't have an active rip.")
-        return
-
-    view = AbortConfirmView(inter.user.id)
-    confirm_msg = await eph_send(inter, "Download currently in process, are you SURE? [Y/N]", view=view)
-    await view.wait()
-    try: await confirm_msg.edit(view=None)
-    except discord.HTTPException: pass
-
-    if not view.confirmed:
-        await eph_send(inter, "Abort cancelled.")
-        return
-
-    # User confirmed: immediately mark cancelled
-    pr: ProgressReporter = job["pr"]; pr.cancelled = True
-    await eph_send(inter, "Aborted.")
-
-# ---------- core rip flow ----------
+# ---------- main ripping flow ----------
 async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
     big_zip, _ = await maybe_notify_zip(inter, link)
     include_art = await ask_artwork(inter, big_zip=big_zip)
@@ -521,8 +552,9 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
                     except discord.HTTPException:
                         # emergency zip-split
                         base = _safe_base("bundle")
-                        parts = pack_into_zip_parts(base, tmpdir, items, track_meta=[{"index":i+1,"title":n} for i,(_,n) in enumerate(items)],
-                                                    cover_path=None, size_limit=MAX_FILE_BYTES_HINT)
+                        parts = pack_into_zip_parts(base, tmpdir, items,
+                            track_meta=[{"index":i+1,"title":n} for i,(_,n) in enumerate(items)],
+                            cover_path=None, size_limit=MAX_FILE_BYTES_HINT)
                         payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
                         if to_dm:
                             dm = await inter.user.create_dm(); await dm.send(content=attribution, files=payload)
@@ -538,7 +570,8 @@ async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
         clear_active(inter.user.id)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ---------- slash: rip / ripdm ----------
+# ---------- /rip ----------
+@guild_scope
 @bot.tree.command(name="rip", description="Rip audio and post to this channel")
 @app_commands.describe(link="YouTube / SoundCloud / Bandcamp link")
 async def rip_cmd(inter: discord.Interaction, link: str):
@@ -552,6 +585,8 @@ async def rip_cmd(inter: discord.Interaction, link: str):
     await inter.response.defer(ephemeral=True)
     await run_rip(inter, link, to_dm=False)
 
+# ---------- /ripdm ----------
+@guild_scope
 @bot.tree.command(name="ripdm", description="Rip audio and DM it to you")
 @app_commands.describe(link="YouTube / SoundCloud / Bandcamp link")
 async def ripdm_cmd(inter: discord.Interaction, link: str):
@@ -564,6 +599,21 @@ async def ripdm_cmd(inter: discord.Interaction, link: str):
         await eph_send(inter, "You already have a rip running. Use `/abort` to cancel it."); return
     await inter.response.defer(ephemeral=True)
     await run_rip(inter, link, to_dm=True)
+
+# ---------- /sync (owner only) ----------
+@guild_scope
+@bot.tree.command(name="sync", description="(Owner) Force re-sync of slash commands here")
+async def sync_here(inter: discord.Interaction):
+    app = await bot.application_info()
+    if inter.user.id != app.owner.id:
+        await inter.response.send_message("Only the bot owner can run this.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True)
+    try:
+        res = await bot.tree.sync(guild=inter.guild)
+        await inter.followup.send(f"Synced {len(res)} command(s) to this guild.", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"Sync failed: `{e}`", ephemeral=True)
 
 # ---------- main ----------
 if __name__ == "__main__":
