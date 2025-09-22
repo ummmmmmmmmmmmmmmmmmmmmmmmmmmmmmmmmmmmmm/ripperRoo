@@ -1,51 +1,48 @@
-# bot.py
+# bot.py (slash-only)
 import os, re, stat, time, random, zipfile, shutil, tempfile, asyncio, pathlib, datetime as dt
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-# ===================== Config =====================
+# ======= Config =======
 TOKEN = os.getenv("DISCORD_TOKEN")              # set this in your environment
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")
 MAX_FILE_BYTES_HINT = int(os.getenv("MAX_FILE_BYTES_HINT", str(25 * 1024 * 1024)))  # e.g., 25 MiB
-# ===================================================
+# ======================
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="*", intents=intents, help_command=None)
+intents = discord.Intents.default()  # no text-prefix commands
+bot = commands.Bot(command_prefix="!", intents=intents)  # prefix unused; all commands are slash-only
 
 HELP_TEXT = (
     "**ripperRoo — a Discord mp3 ripper created by d-rod**\n"
-    "• `*rip <link>` or `/rip` — rip YouTube, SoundCloud, or Bandcamp audio and post it here\n"
-    "• `*ripdm <link>` or `/ripdm` — rip and DM you the file\n"
-    "• `*abort` or `/abort` — abort **your** current rip\n\n"
+    "• `/rip <link>` — rip YouTube, SoundCloud, or Bandcamp audio and post it here\n"
+    "• `/ripdm <link>` — rip and DM you the file\n"
+    "• `/abort` — abort **your** current rip\n\n"
     "_Tip: to auto-delete your command after sending files, give my role **Manage Messages** in this channel._"
 )
 
-# One active rip per user; track messages to delete on abort/completion (only for non-ephemeral use)
+# Active rips by user id (per guild/channel)
 ACTIVE_RIPS: Dict[int, Dict] = {}
 
-# ---------- utilities ----------
+# ---------- util ----------
 def human_mb(n: Optional[float]) -> str:
-    try:
-        return f"{(n or 0)/1024/1024:.1f} MB"
-    except Exception:
-        return "0 MB"
+    try: return f"{(n or 0)/1024/1024:.1f} MB"
+    except Exception: return "0 MB"
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def provider_of(link: str) -> Tuple[str, str]:
     try:
-        u = urlparse(link)
-        host = (u.hostname or "").lower()
+        u = urlparse(link); host = (u.hostname or "").lower()
         if host.startswith("www."): host = host[4:]
         if "soundcloud.com" in host: return "SoundCloud", link
         if "bandcamp.com"   in host: return "Bandcamp", link
-        if host in {"youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be"}: return "YouTube", link
+        if host in {"youtube.com","music.youtube.com","m.youtube.com","youtu.be"}: return "YouTube", link
         if host == "open.spotify.com": return "Spotify", link
         return "Source", link
     except Exception:
@@ -53,88 +50,30 @@ def provider_of(link: str) -> Tuple[str, str]:
 
 def detect_playlist(link: str) -> Tuple[bool, str]:
     try:
-        u = urlparse(link)
-        host = (u.hostname or "").lower() if u.hostname else ""
+        u = urlparse(link); host = (u.hostname or "").lower() if u.hostname else ""
         if host.startswith("www."): host = host[4:]
-        if host in {"youtube.com", "music.youtube.com", "m.youtube.com"}:
+        if host in {"youtube.com","music.youtube.com","m.youtube.com"}:
             qs = parse_qs(u.query or "")
-            if "list" in qs or (u.path or "").startswith("/playlist"): return True, "youtube"
+            if "list" in qs or (u.path or "").startswith("/playlist"): return True,"youtube"
         if host == "youtu.be":
-            if "list" in parse_qs(u.query or ""): return True, "youtube"
-        if "soundcloud.com" in host and "/sets/" in (u.path or ""): return True, "soundcloud"
-        if "bandcamp.com"   in host and "/album/" in (u.path or ""): return True, "bandcamp"
-        if host == "open.spotify.com" and "/playlist/" in (u.path or ""): return True, "spotify"
-        return False, "unknown"
+            if "list" in parse_qs(u.query or ""): return True,"youtube"
+        if "soundcloud.com" in host and "/sets/"  in (u.path or ""): return True,"soundcloud"
+        if "bandcamp.com"   in host and "/album/" in (u.path or ""): return True,"bandcamp"
+        if host == "open.spotify.com" and "/playlist/" in (u.path or ""): return True,"spotify"
+        return False,"unknown"
     except Exception:
-        return False, "unknown"
+        return False,"unknown"
 
 def ok_domain(link: str) -> bool:
     try:
         host = (urlparse(link).hostname or "").lower()
-        return (
-            host.endswith("youtube.com") or host == "youtu.be" or
-            host.endswith("soundcloud.com") or
-            host.endswith("bandcamp.com")
-        )
+        return (host.endswith("youtube.com") or host == "youtu.be" or
+                host.endswith("soundcloud.com") or host.endswith("bandcamp.com"))
     except Exception:
         return False
 
 def _safe_base(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "playlist"
-
-def is_interaction_ctx(ctx: commands.Context) -> bool:
-    return getattr(ctx, "interaction", None) is not None
-
-async def countdown_delete_message(msg: discord.Message, seconds: int = 5):
-    """Append a live countdown line and then delete (non-ephemeral path only)."""
-    try:
-        for t in range(seconds, 0, -1):
-            try:
-                await msg.edit(content=f"{msg.content}\n[This message will be deleted in {t}]")
-            except discord.HTTPException:
-                pass
-            await asyncio.sleep(1)
-    finally:
-        try: await msg.delete()
-        except discord.HTTPException: pass
-
-def record_msg(ctx: commands.Context, msg: discord.Message):
-    # Only record when NOT using ephemeral (prefix usage)
-    if is_interaction_ctx(ctx):
-        return
-    job = ACTIVE_RIPS.get(ctx.author.id)
-    if job is not None:
-        job.setdefault("msgs", []).append(msg)
-
-async def delete_recorded_msgs(ctx: commands.Context):
-    job = ACTIVE_RIPS.get(ctx.author.id)
-    if not job: return
-    for m in job.get("msgs", []):
-        try: await m.delete()
-        except discord.HTTPException: pass
-    job["msgs"] = []
-
-# ---------- private (ephemeral-aware) reply helper ----------
-async def priv_reply(ctx: commands.Context, content: Optional[str] = None, *, view: Optional[discord.ui.View] = None, countdown: Optional[int] = None) -> discord.Message:
-    """
-    Send an ephemeral message to the invoker if ctx comes from a slash command.
-    Otherwise send a normal channel message (and optionally auto-delete).
-    Returns the Message so callers can edit it.
-    """
-    if is_interaction_ctx(ctx):
-        # First response must use interaction.response; subsequent ones use followup
-        if not ctx.interaction.response.is_done():
-            await ctx.interaction.response.send_message(content=content or "\u200b", view=view, ephemeral=True)
-            msg = await ctx.interaction.original_response()
-        else:
-            msg = await ctx.interaction.followup.send(content=content or "\u200b", view=view, ephemeral=True, wait=True)
-        return msg
-    else:
-        msg = await ctx.reply(content=content or "\u200b", view=view, mention_author=False)
-        record_msg(ctx, msg)
-        if countdown:
-            asyncio.create_task(countdown_delete_message(msg, countdown))
-        return msg
 
 # ---------- startup temp cleanup ----------
 def _safe_rmtree(p: Path):
@@ -147,7 +86,6 @@ def _safe_rmtree(p: Path):
     shutil.rmtree(p, ignore_errors=False, onerror=onerr)
 
 def clean_stale_tmp(prefix: str = "rip-", max_age_hours: int = 36):
-    """Delete leftover rip-* temp folders older than max_age_hours."""
     tmp = Path(tempfile.gettempdir())
     cutoff = dt.datetime.now().timestamp() - max_age_hours * 3600
     for child in tmp.iterdir():
@@ -158,14 +96,23 @@ def clean_stale_tmp(prefix: str = "rip-", max_age_hours: int = 36):
         except Exception:
             pass
 
-# ---------- musical progress bar ----------
+# ---------- ephemeral helpers ----------
+async def eph_send(inter: discord.Interaction, content: str = "\u200b", *, view: discord.ui.View | None = None) -> discord.Message:
+    """Send or follow up with an ephemeral message, return the message so we can edit it later."""
+    if not inter.response.is_done():
+        await inter.response.send_message(content=content, view=view, ephemeral=True)
+        return await inter.original_response()
+    else:
+        return await inter.followup.send(content=content, view=view, ephemeral=True, wait=True)
+
+# ---------- progress bar ----------
 NOTE_GLYPHS = ["𝆕","𝅘𝅥","𝅗𝅥","𝅘𝅥𝅮","♩","♪","♫","♬"]
 
 class ProgressReporter:
-    def __init__(self, ctx: commands.Context):
-        self.ctx = ctx
+    def __init__(self, inter: discord.Interaction):
+        self.inter = inter
         self.msg: Optional[discord.Message] = None
-        self._last_edit = 0.0
+        self._last = 0.0
         self.total_tracks = 1
         self.current_index = 1
         self.current_title = ""
@@ -177,9 +124,9 @@ class ProgressReporter:
 
     async def start(self):
         if not self.msg:
-            self.msg = await priv_reply(self.ctx, "Process starting…")
+            self.msg = await eph_send(self.inter, "Process starting…")
 
-    def _music_bar(self) -> str:
+    def _bar(self) -> str:
         filled = clamp(int(round(self.percent/100 * self.bar_width)), 0, self.bar_width)
         notes = "".join(random.choice(NOTE_GLYPHS) for _ in range(filled))
         rest  = "-" * (self.bar_width - filled)
@@ -188,29 +135,27 @@ class ProgressReporter:
     async def update(self, force: bool=False):
         if not self.msg: return
         now = time.time()
-        if not force and now - self._last_edit < 0.45: return
-        self._last_edit = now
-
-        title = (self.current_title or "").strip()
+        if not force and now - self._last < 0.45: return
+        self._last = now
+        title = (self.current_title or "")
         title = title if len(title) <= 70 else title[:67]+"…"
         header = f"**[{self.current_index}/{self.total_tracks}] {title}**"
         size = f"{human_mb(self.d_bytes)}" + (f" / {human_mb(self.t_bytes)}" if self.t_bytes else "")
-        content = f"{header}\n{self._music_bar()}  {self.percent:>3d}% ({size})"
+        content = f"{header}\n{self._bar()}  {self.percent:>3d}% ({size})"
         try: await self.msg.edit(content=content)
         except discord.HTTPException: pass
 
     async def replace(self, text: str):
         if not self.msg:
-            self.msg = await priv_reply(self.ctx, text)
+            self.msg = await eph_send(self.inter, text)
         else:
             try: await self.msg.edit(content=text)
             except discord.HTTPException: pass
 
-# ---------- yt_dlp helpers & geo capture ----------
+# ---------- yt-dlp ----------
 class CaptureLogger:
     def __init__(self):
-        self.errors: List[str] = []
-        self.warnings: List[str] = []
+        self.errors: List[str] = []; self.warnings: List[str] = []
     def debug(self, msg): pass
     def info(self, msg):  pass
     def warning(self, msg): self.warnings.append(str(msg))
@@ -219,9 +164,8 @@ class CaptureLogger:
 def make_hook(pr: ProgressReporter, loop: asyncio.AbstractEventLoop):
     def hook(d):
         try:
-            if pr.cancelled:
-                raise yt_dlp.utils.DownloadError("User aborted")
-            if d.get("status") in ("downloading", "finished"):
+            if pr.cancelled: raise yt_dlp.utils.DownloadError("User aborted")
+            if d.get("status") in ("downloading","finished"):
                 info = d.get("info_dict") or {}
                 if info.get("title"): pr.current_title = info["title"]
                 if info.get("playlist_index"): pr.current_index = int(info["playlist_index"])
@@ -238,7 +182,7 @@ def make_hook(pr: ProgressReporter, loop: asyncio.AbstractEventLoop):
 def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter,
              loop: asyncio.AbstractEventLoop, caplog: CaptureLogger) -> dict:
     pp = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
-    opts = {
+    o = {
         "outtmpl": os.path.join(tmpdir, "%(playlist_index)03d - %(title)s.%(ext)s"),
         "format": "bestaudio/best",
         "noprogress": True,
@@ -246,29 +190,26 @@ def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter,
         "ffmpeg_location": FFMPEG_BIN or None,
         "yesplaylist": True,
         "ignoreerrors": "only_download",
-        "cachedir": False,                # don't use user cache dir
+        "cachedir": False,
         "progress_hooks": [make_hook(pr, loop)],
         "logger": caplog,
     }
     if include_thumbs:
-        opts["writethumbnail"] = True
+        o["writethumbnail"] = True
         pp.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
-    opts["postprocessors"] = pp
-    return opts
+    o["postprocessors"] = pp
+    return o
 
 def _resolve_outpath(ydl: yt_dlp.YoutubeDL, entry: dict, fallback=("mp3","m4a","webm","opus")) -> str:
-    if entry.get("requested_downloads"):
-        return entry["requested_downloads"][0]["filepath"]
-    base = ydl.prepare_filename(entry)
-    root, _ = os.path.splitext(base)
+    if entry.get("requested_downloads"): return entry["requested_downloads"][0]["filepath"]
+    base = ydl.prepare_filename(entry); root,_ = os.path.splitext(base)
     for ext in fallback:
         p = f"{root}.{ext}"
         if os.path.exists(p): return p
     return f"{root}.mp3"
 
 def _maybe_thumb_path_from_media_path(media_path: str) -> Optional[str]:
-    root, _ = os.path.splitext(media_path)
-    jpg = root + ".jpg"
+    root,_ = os.path.splitext(media_path); jpg = root + ".jpg"
     return jpg if os.path.exists(jpg) else None
 
 async def probe_playlist_count(link: str) -> Optional[int]:
@@ -277,35 +218,27 @@ async def probe_playlist_count(link: str) -> Optional[int]:
             info = ydl.extract_info(link, download=False)
             if isinstance(info, dict) and info.get("entries") is not None:
                 return len([e for e in info["entries"] if e])
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool, pr: ProgressReporter):
-    main_loop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     caplog = CaptureLogger()
-
     def do_download():
-        with yt_dlp.YoutubeDL(ydl_opts(tmpdir, include_thumbs, pr, main_loop, caplog)) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts(tmpdir, include_thumbs, pr, loop, caplog)) as ydl:
             info = ydl.extract_info(link, download=True)
             return info, ydl
-
     info, ydl = await asyncio.to_thread(do_download)
 
-    items: List[Tuple[str, str]] = []
-    meta: List[Dict] = []
-    cover: Optional[str] = None
-
+    items: List[Tuple[str,str]] = []; meta: List[Dict] = []; cover: Optional[str] = None
     if "entries" in info and info["entries"] is not None:
         title = info.get("title") or "playlist"
         for ent in info["entries"]:
             if not ent:
-                meta.append({"index": None, "title": None, "thumb": None})
-                continue
+                meta.append({"index": None, "title": None, "thumb": None}); continue
             path = _resolve_outpath(ydl, ent)
             ttitle = ent.get("title") or "audio"
-            root, _ = os.path.splitext(path)
-            mp3 = root + ".mp3"
+            root,_ = os.path.splitext(path); mp3 = root + ".mp3"
             final = mp3 if os.path.exists(mp3) else path
             items.append((final, f"{ttitle}.mp3"))
             idx = ent.get("playlist_index")
@@ -316,8 +249,7 @@ async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool, p
     else:
         title = info.get("title") or "audio"
         path = _resolve_outpath(ydl, info)
-        root, _ = os.path.splitext(path)
-        mp3 = root + ".mp3"
+        root,_ = os.path.splitext(path); mp3 = root + ".mp3"
         final = mp3 if os.path.exists(mp3) else path
         items.append((final, f"{title}.mp3"))
         thumb = _maybe_thumb_path_from_media_path(final) if include_thumbs else None
@@ -325,7 +257,7 @@ async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool, p
         meta.append({"index": None, "title": title, "thumb": thumb})
         return items, title, False, meta, cover, caplog
 
-# ---------- zipping / size helpers ----------
+# ---------- zipping / size ----------
 def _filesize(path: str) -> int:
     try: return os.path.getsize(path)
     except Exception: return 0
@@ -338,193 +270,98 @@ def make_zip(path_out: str, files: List[Tuple[str,str]], *, track_meta: List[Dic
         for i, m in [(i, m) for i, m in ordered] if m.get("title")
     ])
     with zipfile.ZipFile(path_out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p, n in files:
-            if os.path.exists(p):
-                zf.write(p, arcname=n)
+        for p,n in files:
+            if os.path.exists(p): zf.write(p, arcname=n)
         zf.writestr("tracklist.txt", tracklist_txt)
         if include_cover and cover_path and os.path.exists(cover_path):
             ext = pathlib.Path(cover_path).suffix.lower()
             zf.write(cover_path, arcname=f"artwork{ext}")
 
-def pack_into_zip_parts(
-    base_name: str,
-    tmpdir: str,
-    files: List[Tuple[str,str]],
-    *,
-    track_meta: List[Dict],
-    cover_path: Optional[str],
-    size_limit: int
-) -> List[str]:
-    parts: List[List[Tuple[str,str]]] = [[]]
-    sizes: List[int] = [0]
-    overhead_per_file = 4096
-
-    for fpath, fname in files:
-        fsz = _filesize(fpath) + overhead_per_file
+def pack_into_zip_parts(base_name: str, tmpdir: str, files: List[Tuple[str,str]], *,
+                        track_meta: List[Dict], cover_path: Optional[str], size_limit: int) -> List[str]:
+    parts: List[List[Tuple[str,str]]] = [[]]; sizes: List[int] = [0]; overhead = 4096
+    for fpath,fname in files:
+        fsz = _filesize(fpath) + overhead
         if sizes[-1] + fsz > size_limit and parts[-1]:
-            parts.append([(fpath, fname)])
-            sizes.append(fsz)
+            parts.append([(fpath,fname)]); sizes.append(fsz)
         else:
-            parts[-1].append((fpath, fname))
-            sizes[-1] += fsz
-
-    outpaths: List[str] = []
-    for i, bundle in enumerate(parts, start=1):
+            parts[-1].append((fpath,fname)); sizes[-1] += fsz
+    out: List[str] = []
+    for i,bundle in enumerate(parts, start=1):
         suffix = f"_part{i}.zip" if len(parts) > 1 else ".zip"
-        out = os.path.join(tmpdir, f"{base_name}{suffix}")
-        make_zip(out, bundle, track_meta=track_meta, cover_path=cover_path, include_cover=(i == 1))
-        outpaths.append(out)
-    return outpaths
+        outzip = os.path.join(tmpdir, f"{base_name}{suffix}")
+        make_zip(outzip, bundle, track_meta=track_meta, cover_path=cover_path, include_cover=(i==1))
+        out.append(outzip)
+    return out
 
 def make_single_zip(files: List[Tuple[str,str]], out_zip: str, *, track_meta: List[Dict], cover_path: Optional[str]):
     make_zip(out_zip, files, track_meta=track_meta, cover_path=cover_path, include_cover=True)
 
-def build_attribution(ctx: commands.Context, link: str) -> Optional[str]:
-    if ctx.guild is None: return None
-    display = ctx.author.display_name
-    uname = ctx.author.name
+def build_attribution(inter: discord.Interaction, link: str) -> Optional[str]:
+    if inter.guild is None: return None
+    disp = inter.user.display_name; uname = inter.user.name
     provider, url = provider_of(link)
-    return f"ripped by: {display}({uname}) from [{provider}]({url})"
+    return f"ripped by: {disp}({uname}) from [{provider}]({url})"
 
-# ---------- sending helpers ----------
-async def send_single_file_with_banner(ctx: commands.Context, path: str, name: str, *,
-                                       to_dm: bool, attribution: Optional[str]):
-    content = attribution if (attribution and not to_dm) else None
-    try:
-        if to_dm:
-            dm = await ctx.author.create_dm()
-            await dm.send(content=content, file=discord.File(path, filename=name))
-        else:
-            await ctx.send(content=content, file=discord.File(path, filename=name))
-    except discord.HTTPException as e:
-        hint = ""
-        try: hint = f" (size ~{os.path.getsize(path)/1024/1024:.1f} MB)"
-        except Exception: pass
-        msg = await priv_reply(ctx, f"Failed to upload file{hint}. Discord may have rejected it due to size.", countdown=None)
-        if not is_interaction_ctx(ctx):
-            await countdown_delete_message(msg, 5)
-        raise e
-
-async def send_many_try_one_message_then_fallback(ctx: commands.Context, files: List[Tuple[str,str]], *,
-                                                  to_dm: bool, attribution: Optional[str]):
-    try:
-        payload = [discord.File(p, filename=n) for p, n in files]
-        content = attribution if (attribution and not to_dm) else None
-        if to_dm:
-            dm = await ctx.author.create_dm()
-            await dm.send(content=content, files=payload)
-        else:
-            await ctx.send(content=content, files=payload)
-    except discord.HTTPException:
-        # Try per-file fallback first
-        sent_any = False
-        for p, n in files:
-            try:
-                await send_single_file_with_banner(ctx, p, n, to_dm=to_dm, attribution=attribution)
-                sent_any = True
-            except discord.HTTPException:
-                sent_any = sent_any or False
-        if not sent_any:
-            # Emergency: zip-split the whole bundle and send parts
-            tmpdir = tempfile.mkdtemp(prefix="rip-fallback-")
-            try:
-                base = _safe_base("bundle")
-                parts = pack_into_zip_parts(
-                    base_name=base, tmpdir=tmpdir, files=files,
-                    track_meta=[{"index": i+1, "title": n} for i, (_, n) in enumerate(files)],
-                    cover_path=None, size_limit=MAX_FILE_BYTES_HINT
-                )
-                files_payload = [(p, os.path.basename(p)) for p in parts]
-                try:
-                    payload = [discord.File(p, filename=n) for p, n in files_payload]
-                    content = attribution if (attribution and not to_dm) else None
-                    if to_dm:
-                        dm = await ctx.author.create_dm()
-                        await dm.send(content=content, files=payload)
-                    else:
-                        await ctx.send(content=content, files=payload)
-                except discord.HTTPException:
-                    msg = await priv_reply(ctx, "Couldn’t upload due to size limits, even after splitting.")
-                    if not is_interaction_ctx(ctx):
-                        await countdown_delete_message(msg, 5)
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-
-async def delete_invoke_safely(ctx: commands.Context):
-    try: await ctx.message.delete()
-    except (discord.Forbidden, discord.HTTPException, AttributeError): pass
-
-# ---------- Views (Artwork, Geo, Abort confirm) ----------
+# ---------- views ----------
 class ArtChoiceView(discord.ui.View):
     def __init__(self, author_id: int, *, timeout: float = 30.0):
-        super().__init__(timeout=timeout)
-        self.author_id = author_id
-        self.include_art: Optional[bool] = None
+        super().__init__(timeout=timeout); self.author_id = author_id; self.include_art: Optional[bool] = None
     async def interaction_check(self, itx: discord.Interaction) -> bool:
         if itx.user.id != self.author_id:
-            await itx.response.send_message("This prompt isn’t for you.", ephemeral=True)
-            return False
+            await itx.response.send_message("This prompt isn’t for you.", ephemeral=True); return False
         return True
     @discord.ui.button(label="Include", style=discord.ButtonStyle.primary)
     async def yes(self, itx: discord.Interaction, _: discord.ui.Button):
-        self.include_art = True
-        for c in self.children: c.disabled = True
-        await itx.response.edit_message(content="Artwork will be included.", view=self)
-        self.stop()
+        self.include_art = True; [setattr(c,"disabled",True) for c in self.children]
+        await itx.response.edit_message(content="Artwork will be included.", view=self); self.stop()
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
     async def no(self, itx: discord.Interaction, _: discord.ui.Button):
-        self.include_art = False
-        for c in self.children: c.disabled = True
-        await itx.response.edit_message(content="Audio only.", view=self)
-        self.stop()
+        self.include_art = False; [setattr(c,"disabled",True) for c in self.children]
+        await itx.response.edit_message(content="Audio only.", view=self); self.stop()
 
 class GeoDecisionView(discord.ui.View):
     def __init__(self, author_id: int, *, timeout: float = 45.0):
-        super().__init__(timeout=timeout)
-        self.author_id = author_id
-        self.choice: Optional[str] = None
+        super().__init__(timeout=timeout); self.author_id = author_id; self.choice: Optional[str] = None
     async def interaction_check(self, itx: discord.Interaction) -> bool:
         if itx.user.id != self.author_id:
-            await itx.response.send_message("This prompt isn’t for you.", ephemeral=True)
-            return False
+            await itx.response.send_message("This prompt isn’t for you.", ephemeral=True); return False
         return True
     @discord.ui.button(label="Ignore & Continue", style=discord.ButtonStyle.primary)
     async def cont(self, itx: discord.Interaction, _: discord.ui.Button):
-        self.choice = "continue"
-        for c in self.children: c.disabled = True
-        await itx.response.edit_message(content="Continuing without the blocked tracks…", view=self)
-        self.stop()
+        self.choice = "continue"; [setattr(c,"disabled",True) for c in self.children]
+        await itx.response.edit_message(content="Continuing without the blocked tracks…", view=self); self.stop()
     @discord.ui.button(label="Abort", style=discord.ButtonStyle.danger)
     async def abort(self, itx: discord.Interaction, _: discord.ui.Button):
-        self.choice = "abort"
-        for c in self.children: c.disabled = True
-        await itx.response.edit_message(content="Cancelling…", view=self)
-        self.stop()
+        self.choice = "abort"; [setattr(c,"disabled",True) for c in self.children]
+        await itx.response.edit_message(content="Cancelling…", view=self); self.stop()
 
 class AbortConfirmView(discord.ui.View):
     def __init__(self, author_id: int, *, timeout: float = 30.0):
-        super().__init__(timeout=timeout)
-        self.author_id = author_id
-        self.confirmed = False
+        super().__init__(timeout=timeout); self.author_id = author_id; self.confirmed = False
     async def interaction_check(self, itx: discord.Interaction) -> bool:
         if itx.user.id != self.author_id:
-            await itx.response.send_message("This prompt isn’t for you.", ephemeral=True)
-            return False
+            await itx.response.send_message("This prompt isn’t for you.", ephemeral=True); return False
         return True
     @discord.ui.button(label="Y", style=discord.ButtonStyle.danger)
     async def yes(self, itx: discord.Interaction, _: discord.ui.Button):
-        self.confirmed = True
-        for c in self.children: c.disabled = True
-        await itx.response.edit_message(content="Aborting…", view=self)
-        self.stop()
+        self.confirmed = True; [setattr(c,"disabled",True) for c in self.children]
+        await itx.response.edit_message(content="Aborting…", view=self); self.stop()
     @discord.ui.button(label="N", style=discord.ButtonStyle.secondary)
     async def no(self, itx: discord.Interaction, _: discord.ui.Button):
-        self.confirmed = False
-        for c in self.children: c.disabled = True
-        await itx.response.edit_message(content="Abort cancelled.", view=self)
-        self.stop()
+        self.confirmed = False; [setattr(c,"disabled",True) for c in self.children]
+        await itx.response.edit_message(content="Abort cancelled.", view=self); self.stop()
 
 # ---------- events ----------
+@bot.event
+async def on_ready():
+    try: clean_stale_tmp()
+    except Exception: pass
+    try: await bot.tree.sync()
+    except Exception as e: print(f"Slash sync error: {e}")
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    print("Ready.")
+
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     chan = None
@@ -532,266 +369,201 @@ async def on_guild_join(guild: discord.Guild):
         chan = guild.system_channel
     else:
         for c in guild.text_channels:
-            if c.permissions_for(guild.me).send_messages:
-                chan = c; break
+            if c.permissions_for(guild.me).send_messages: chan = c; break
     if chan:
-        try:
-            await chan.send("Thanks for adding me! Please type `*help` or use `/help` for a list of commands.")
-        except discord.HTTPException:
-            pass
+        try: await chan.send("Thanks for adding me! Use `/help` for commands.")
+        except discord.HTTPException: pass
 
-@bot.event
-async def on_ready():
-    try: clean_stale_tmp()
-    except Exception: pass
-    # Sync slash (app) commands if needed
-    try:
-        await bot.tree.sync()
-    except Exception:
-        pass
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
-    print("Ready.")
-
-# ---------- help ----------
-@commands.hybrid_command(name="help")
-async def _help(ctx: commands.Context):
-    msg = await priv_reply(ctx, HELP_TEXT)
-    if not is_interaction_ctx(ctx):  # only need countdown on non-ephemeral
-        await countdown_delete_message(msg, 5)
-        await delete_invoke_safely(ctx)
-
-# ---------- prompts ----------
-async def maybe_notify_zip(ctx: commands.Context, link: str) -> Tuple[bool, Optional[int]]:
+# ---------- core helpers ----------
+async def maybe_notify_zip(inter: discord.Interaction, link: str) -> Tuple[bool, Optional[int]]:
     is_pl, provider = detect_playlist(link)
     if not is_pl: return False, None
     if provider == "spotify":
-        m = await priv_reply(ctx, "Spotify playlists aren’t supported.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(m, 5)
-        return False, None
+        await eph_send(inter, "Spotify playlists aren’t supported."); return False, None
     count = await probe_playlist_count(link)
     if count is not None and count > 5:
         prov = "YouTube" if provider == "youtube" else ("SoundCloud" if provider == "soundcloud" else "Bandcamp")
-        m = await priv_reply(ctx, f"Detected a {prov} playlist with {count} tracks.\nIt exceeds 5 tracks, so I will zip the audio.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(m, 5)
+        await eph_send(inter, f"Detected a {prov} playlist with {count} tracks.\nIt exceeds 5 tracks, so I will zip the audio.")
         return True, count
     return False, count
 
-async def ask_artwork(ctx: commands.Context, *, big_zip: bool) -> Tuple[bool, Optional[discord.Message]]:
-    view = ArtChoiceView(ctx.author.id, timeout=30)
-    text = "Include Artwork in the .zip?" if big_zip else "Include Artwork? (Yes will zip the file.)"
-    prompt = await priv_reply(ctx, text, view=view)
-    # When ripping starts we'll delete only if non-ephemeral; ephemeral leaves no trace to others
-    return True if isinstance(view.include_art, bool) and view.include_art else False, prompt
+async def ask_artwork(inter: discord.Interaction, *, big_zip: bool) -> bool:
+    v = ArtChoiceView(inter.user.id, timeout=30)
+    prompt = "Include Artwork in the .zip?" if big_zip else "Include Artwork? (Yes will zip the file.)"
+    m = await eph_send(inter, prompt, view=v)
+    await v.wait()
+    try: await m.edit(view=None)
+    except discord.HTTPException: pass
+    return bool(v.include_art)
 
-# ---------- abort helpers ----------
 def user_has_active(uid: int) -> bool: return uid in ACTIVE_RIPS
 def clear_active(uid: int): ACTIVE_RIPS.pop(uid, None)
 
-@commands.hybrid_command(name="abort")
-async def abort(ctx: commands.Context):
-    job = ACTIVE_RIPS.get(ctx.author.id)
+# ---------- slash: help ----------
+@bot.tree.command(name="help", description="Show commands")
+async def help_cmd(inter: discord.Interaction):
+    await eph_send(inter, HELP_TEXT)
+
+# ---------- slash: abort ----------
+@bot.tree.command(name="abort", description="Abort your current rip")
+async def abort_cmd(inter: discord.Interaction):
+    job = ACTIVE_RIPS.get(inter.user.id)
     if not job:
-        msg = await priv_reply(ctx, "You don't have an active rip.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(msg, 5)
+        await eph_send(inter, "You don't have an active rip.")
         return
 
-    # Ask for confirmation (only the invoker can respond)
-    view = AbortConfirmView(ctx.author.id)
-    confirm_msg = await priv_reply(ctx, "Download currently in process, are you SURE? [Y/N]", view=view)
-    # Wait for the interaction on the buttons
-    # (The view’s callbacks will set confirmed and edit the ephemeral message.)
-    # Give it time to complete
-    await asyncio.sleep(0)  # yield to event loop
-    # We need to wait until the view stops
-    try:
-        await view.wait()
-    except Exception:
-        pass
-
-    # Remove buttons (best-effort)
-    try:
-        await confirm_msg.edit(view=None)
-    except discord.HTTPException:
-        pass
+    view = AbortConfirmView(inter.user.id)
+    confirm_msg = await eph_send(inter, "Download currently in process, are you SURE? [Y/N]", view=view)
+    await view.wait()
+    try: await confirm_msg.edit(view=None)
+    except discord.HTTPException: pass
 
     if not view.confirmed:
-        # Clean up the prompt too so nothing lingers (non-ephemeral only)
-        if not is_interaction_ctx(ctx):
-            try: await confirm_msg.delete()
-            except discord.HTTPException: pass
-            msg = await priv_reply(ctx, "Abort cancelled.")
-            await countdown_delete_message(msg, 5)
+        await eph_send(inter, "Abort cancelled.")
         return
 
-    # User confirmed: delete the confirmation message IMMEDIATELY (non-ephemeral only)
-    if not is_interaction_ctx(ctx):
-        try: await confirm_msg.delete()
-        except discord.HTTPException: pass
+    # User confirmed: immediately mark cancelled
+    pr: ProgressReporter = job["pr"]; pr.cancelled = True
+    await eph_send(inter, "Aborted.")
 
-    # Signal cancel & delete all progress/prompt messages for this rip
-    pr: ProgressReporter = job["pr"]
-    pr.cancelled = True
-    await delete_recorded_msgs(ctx)
+# ---------- core rip flow ----------
+async def run_rip(inter: discord.Interaction, link: str, *, to_dm: bool):
+    big_zip, _ = await maybe_notify_zip(inter, link)
+    include_art = await ask_artwork(inter, big_zip=big_zip)
 
-    # Brief final notice that self-deletes (in ephemeral case it auto-hides)
-    msg = await priv_reply(ctx, "Aborted.")
-    if not is_interaction_ctx(ctx):
-        await countdown_delete_message(msg, 5)
-
-# -------------- core flows --------------
-async def run_rip(ctx: commands.Context, link: str, *, to_dm: bool):
-    big_zip, _ = await maybe_notify_zip(ctx, link)
-    include_art, art_prompt = await ask_artwork(ctx, big_zip=big_zip)
-
-    pr = ProgressReporter(ctx); await pr.start()
+    pr = ProgressReporter(inter); await pr.start()
     est_count = await probe_playlist_count(link)
     if est_count and est_count > 0: pr.total_tracks = est_count
 
-    # remove artwork prompt right as we begin (only needed for non-ephemeral path)
-    if art_prompt and not is_interaction_ctx(ctx):
-        try: await art_prompt.delete()
-        except discord.HTTPException: pass
-
     tmpdir = tempfile.mkdtemp(prefix="rip-")
-    ACTIVE_RIPS[ctx.author.id] = {"pr": pr, "tmpdir": tmpdir, "msgs": ([] if is_interaction_ctx(ctx) else [pr.msg])}
+    ACTIVE_RIPS[inter.user.id] = {"pr": pr, "tmpdir": tmpdir}
 
     try:
         items, title, is_pl, meta, cover, caplog = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art, pr=pr)
 
-        # Geo-restriction (playlist)
-        geo_lines = [ln for ln in (caplog.errors + caplog.warnings)
-                     if "geo" in ln.lower() or "available from your location" in ln.lower()]
+        geo_lines = [ln for ln in (caplog.errors + caplog.warnings) if "geo" in ln.lower() or "available from your location" in ln.lower()]
         skipped = sum(1 for m in meta if not m.get("title"))
         if geo_lines and is_pl and skipped > 0 and not pr.cancelled:
-            view = GeoDecisionView(ctx.author.id)
-            prompt = await priv_reply(ctx, f"Some tracks appear geo-restricted ({skipped} skipped). Continue without them or abort?", view=view)
-            if not is_interaction_ctx(ctx):
-                record_msg(ctx, prompt)
-            await view.wait()
+            v = GeoDecisionView(inter.user.id)
+            prompt = await eph_send(inter, f"Some tracks appear geo-restricted ({skipped} skipped). Continue without them or abort?", view=v)
+            await v.wait()
             try: await prompt.edit(view=None)
             except discord.HTTPException: pass
-            if view.choice != "continue":
-                if not is_interaction_ctx(ctx):
-                    await delete_recorded_msgs(ctx)
-                m = await priv_reply(ctx, "Aborted.")
-                if not is_interaction_ctx(ctx): await countdown_delete_message(m, 5)
+            if v.choice != "continue":
+                await eph_send(inter, "Aborted.")
                 raise yt_dlp.utils.DownloadError("User aborted after geo prompt")
-            # filter out missing
             items = [it for it in items if os.path.exists(it[0])]
-            meta  = [m for m in meta if m.get("title")]
+            meta  = [m for m in meta  if m.get("title")]
 
         if pr.cancelled:
             raise yt_dlp.utils.DownloadError("User aborted")
 
         await pr.replace("Preparing files…")
-
-        attribution = build_attribution(ctx, link)
+        attribution = build_attribution(inter, link)
 
         if include_art:
-            safe = _safe_base(title)
-            zip_path = os.path.join(tmpdir, f"{safe}.zip")
+            safe = _safe_base(title); zip_path = os.path.join(tmpdir, f"{safe}.zip")
             make_single_zip(items, zip_path, track_meta=meta, cover_path=cover)
             try:
                 if os.path.getsize(zip_path) > MAX_FILE_BYTES_HINT:
                     await pr.replace("Preparing files… (note: zip may exceed this server's upload cap)")
-            except Exception:
-                pass
+            except Exception: pass
             await pr.replace("Uploading zip…")
             try:
-                await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=to_dm, attribution=attribution)
+                if to_dm:
+                    dm = await inter.user.create_dm()
+                    await dm.send(content=attribution, file=discord.File(zip_path, filename=os.path.basename(zip_path)))
+                else:
+                    await inter.channel.send(content=attribution, file=discord.File(zip_path, filename=os.path.basename(zip_path)))
             except discord.HTTPException:
                 await pr.replace("Zip too large. Splitting into parts…")
-                parts = pack_into_zip_parts(
-                    base_name=_safe_base(safe), tmpdir=tmpdir, files=items,
-                    track_meta=meta, cover_path=cover, size_limit=MAX_FILE_BYTES_HINT
-                )
-                files_payload = [(p, os.path.basename(p)) for p in parts]
-                await send_many_try_one_message_then_fallback(ctx, files_payload, to_dm=to_dm, attribution=attribution)
+                parts = pack_into_zip_parts(_safe_base(safe), tmpdir, items, track_meta=meta, cover_path=cover, size_limit=MAX_FILE_BYTES_HINT)
+                files_payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
+                if to_dm:
+                    dm = await inter.user.create_dm(); await dm.send(content=attribution, files=files_payload)
+                else:
+                    await inter.channel.send(content=attribution, files=files_payload)
         else:
             if is_pl and len(items) > 5:
-                safe = _safe_base(title)
-                zip_path = os.path.join(tmpdir, f"{safe}.zip")
+                safe = _safe_base(title); zip_path = os.path.join(tmpdir, f"{safe}.zip")
                 make_single_zip(items, zip_path, track_meta=meta, cover_path=None)
                 await pr.replace("Uploading zip…")
                 try:
-                    await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=to_dm, attribution=attribution)
+                    if to_dm:
+                        dm = await inter.user.create_dm()
+                        await dm.send(content=attribution, file=discord.File(zip_path, filename=os.path.basename(zip_path)))
+                    else:
+                        await inter.channel.send(content=attribution, file=discord.File(zip_path, filename=os.path.basename(zip_path)))
                 except discord.HTTPException:
                     await pr.replace("Zip too large. Splitting into parts…")
-                    parts = pack_into_zip_parts(
-                        base_name=_safe_base(safe), tmpdir=tmpdir, files=items,
-                        track_meta=meta, cover_path=None, size_limit=MAX_FILE_BYTES_HINT
-                    )
-                    files_payload = [(p, os.path.basename(p)) for p in parts]
-                    await send_many_try_one_message_then_fallback(ctx, files_payload, to_dm=to_dm, attribution=attribution)
+                    parts = pack_into_zip_parts(_safe_base(safe), tmpdir, items, track_meta=meta, cover_path=None, size_limit=MAX_FILE_BYTES_HINT)
+                    files_payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
+                    if to_dm:
+                        dm = await inter.user.create_dm(); await dm.send(content=attribution, files=files_payload)
+                    else:
+                        await inter.channel.send(content=attribution, files=files_payload)
             else:
                 await pr.replace("Uploading…")
                 if len(items) == 1:
-                    p, n = items[0]
-                    await send_single_file_with_banner(ctx, p, n, to_dm=to_dm, attribution=attribution)
+                    p,n = items[0]
+                    if to_dm:
+                        dm = await inter.user.create_dm()
+                        await dm.send(content=attribution, file=discord.File(p, filename=n))
+                    else:
+                        await inter.channel.send(content=attribution, file=discord.File(p, filename=n))
                 else:
-                    await send_many_try_one_message_then_fallback(ctx, items, to_dm=to_dm, attribution=attribution)
+                    payload = [discord.File(p, filename=n) for p,n in items]
+                    try:
+                        if to_dm:
+                            dm = await inter.user.create_dm(); await dm.send(content=attribution, files=payload)
+                        else:
+                            await inter.channel.send(content=attribution, files=payload)
+                    except discord.HTTPException:
+                        # emergency zip-split
+                        base = _safe_base("bundle")
+                        parts = pack_into_zip_parts(base, tmpdir, items, track_meta=[{"index":i+1,"title":n} for i,(_,n) in enumerate(items)],
+                                                    cover_path=None, size_limit=MAX_FILE_BYTES_HINT)
+                        payload = [discord.File(p, filename=os.path.basename(p)) for p in parts]
+                        if to_dm:
+                            dm = await inter.user.create_dm(); await dm.send(content=attribution, files=payload)
+                        else:
+                            await inter.channel.send(content=attribution, files=payload)
 
-        # tidy (non-ephemeral only)
-        if not is_interaction_ctx(ctx):
-            await delete_recorded_msgs(ctx)
-            await delete_invoke_safely(ctx)
-
+        await pr.replace("Done.")
     except yt_dlp.utils.DownloadError as e:
-        if not is_interaction_ctx(ctx):
-            await delete_recorded_msgs(ctx)
-        err = await priv_reply(ctx, "Aborted." if "User aborted" in str(e) else f"Rip failed: `{e}`")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(err, 5)
+        await eph_send(inter, "Aborted." if "User aborted" in str(e) else f"Rip failed: `{e}`")
     except Exception as e:
-        if not is_interaction_ctx(ctx):
-            await delete_recorded_msgs(ctx)
-        err = await priv_reply(ctx, f"Rip failed: `{e}`")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(err, 5)
+        await eph_send(inter, f"Rip failed: `{e}`")
     finally:
-        clear_active(ctx.author.id)
+        clear_active(inter.user.id)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ---------- commands (hybrid: prefix + slash) ----------
-@commands.hybrid_command(name="rip")
-async def rip(ctx: commands.Context, link: Optional[str] = None):
-    if not link:
-        msg = await priv_reply(ctx, "Usage: `*rip <link>` or `/rip <link>`")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(msg, 5); return
-        return
-    if user_has_active(ctx.author.id):
-        m = await priv_reply(ctx, "You already have a rip running. Use `*abort` or `/abort` to cancel it.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(m, 5); return
-        return
+# ---------- slash: rip / ripdm ----------
+@bot.tree.command(name="rip", description="Rip audio and post to this channel")
+@app_commands.describe(link="YouTube / SoundCloud / Bandcamp link")
+async def rip_cmd(inter: discord.Interaction, link: str):
     if not ok_domain(link):
         is_pl, prov = detect_playlist(link)
         if prov == "spotify":
-            warn = await priv_reply(ctx, "Spotify playlists aren’t supported.")
-            if not is_interaction_ctx(ctx): await countdown_delete_message(warn, 5); return
-            return
-        msg = await priv_reply(ctx, "Unsupported link. Try YouTube, SoundCloud, or Bandcamp.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(msg, 5); return
-        return
-    await run_rip(ctx, link, to_dm=False)
+            await eph_send(inter, "Spotify playlists aren’t supported."); return
+        await eph_send(inter, "Unsupported link. Try YouTube, SoundCloud, or Bandcamp."); return
+    if user_has_active(inter.user.id):
+        await eph_send(inter, "You already have a rip running. Use `/abort` to cancel it."); return
+    await inter.response.defer(ephemeral=True)
+    await run_rip(inter, link, to_dm=False)
 
-@commands.hybrid_command(name="ripdm")
-async def ripdm(ctx: commands.Context, link: Optional[str] = None):
-    if not link:
-        msg = await priv_reply(ctx, "Usage: `*ripdm <link>` or `/ripdm <link>`")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(msg, 5); return
-        return
-    if user_has_active(ctx.author.id):
-        m = await priv_reply(ctx, "You already have a rip running. Use `*abort` or `/abort` to cancel it.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(m, 5); return
-        return
+@bot.tree.command(name="ripdm", description="Rip audio and DM it to you")
+@app_commands.describe(link="YouTube / SoundCloud / Bandcamp link")
+async def ripdm_cmd(inter: discord.Interaction, link: str):
     if not ok_domain(link):
         is_pl, prov = detect_playlist(link)
         if prov == "spotify":
-            warn = await priv_reply(ctx, "Spotify playlists aren’t supported.")
-            if not is_interaction_ctx(ctx): await countdown_delete_message(warn, 5); return
-            return
-        msg = await priv_reply(ctx, "Unsupported link. Try YouTube, SoundCloud, or Bandcamp.")
-        if not is_interaction_ctx(ctx): await countdown_delete_message(msg, 5); return
-        return
-    await run_rip(ctx, link, to_dm=True)
+            await eph_send(inter, "Spotify playlists aren’t supported."); return
+        await eph_send(inter, "Unsupported link. Try YouTube, SoundCloud, or Bandcamp."); return
+    if user_has_active(inter.user.id):
+        await eph_send(inter, "You already have a rip running. Use `/abort` to cancel it."); return
+    await inter.response.defer(ephemeral=True)
+    await run_rip(inter, link, to_dm=True)
 
 # ---------- main ----------
 if __name__ == "__main__":
