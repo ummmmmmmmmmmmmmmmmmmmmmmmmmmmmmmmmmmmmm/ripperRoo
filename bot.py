@@ -13,32 +13,26 @@ FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")
 
 # Soft hint for whether a single file may exceed your server cap. We still try to upload.
 MAX_FILE_BYTES_HINT = int(os.getenv("MAX_FILE_BYTES_HINT", str(25 * 1024 * 1024)))  # ~25 MiB
-
-ALLOWED_DOMAINS = {
-    "youtube.com", "www.youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be",
-    "soundcloud.com", "www.soundcloud.com", "on.soundcloud.com"
-}
 # ===================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="*", intents=intents, help_command=None)
 
 HELP_TEXT = (
     "**ripperRoo — a Discord mp3 ripper created by d-rod**\n"
-    "• `*rip <link>` — rip YouTube or SoundCloud audio and post it here\n"
+    "• `*rip <link>` — rip YouTube, SoundCloud, or Bandcamp audio and post it here\n"
     "• `*ripdm <link>` — rip and DM you the file\n\n"
     "_Tip: to auto-delete your command after sending files, give my role **Manage Messages** in this channel._"
 )
 
 # ---------- utilities ----------
-async def countdown_delete_message(msg: discord.Message, seconds: int = 5, prefix: str = ""):
-    """Edits msg with a ticking '[This will be deleted in N]' then deletes it."""
+async def countdown_delete_message(msg: discord.Message, seconds: int = 5, header: Optional[str] = None):
+    """Live-edit a message to include a countdown, then delete it."""
     try:
         for t in range(seconds, 0, -1):
-            content = f"{prefix}[This message will be deleted in {t}]"
-            await msg.edit(content=content)
+            prefix = f"{header}\n" if header else ""
+            await msg.edit(content=f"{prefix}[This message will be deleted in {t}]")
             await asyncio.sleep(1)
     except discord.HTTPException:
         pass
@@ -53,55 +47,67 @@ def provider_of(link: str) -> Tuple[str, str]:
     try:
         u = urlparse(link)
         host = (u.hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if "soundcloud.com" in host:
-            return "SoundCloud", link
-        if host in {"youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be"}:
-            return "YouTube", link
-        if host == "open.spotify.com":
-            return "Spotify", link
+        if host.startswith("www."): host = host[4:]
+        if "soundcloud.com" in host: return "SoundCloud", link
+        if "bandcamp.com" in host: return "Bandcamp", link
+        if host in {"youtube.com", "music.youtube.com", "m.youtube.com", "youtu.be"}: return "YouTube", link
+        if host == "open.spotify.com": return "Spotify", link
         return "Source", link
     except Exception:
         return "Source", link
 
 def detect_playlist(link: str) -> Tuple[bool, str]:
-    """Returns (is_playlist, provider_key) where provider_key in {'youtube','soundcloud','spotify','unknown'}."""
+    """
+    Returns (is_playlist, provider_key) where provider_key in
+    {'youtube','soundcloud','bandcamp','spotify','unknown'}.
+    """
     try:
         u = urlparse(link)
-        host = (u.hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
+        host = (u.hostname or "").lower() if u.hostname else ""
+        if host.startswith("www."): host = host[4:]
+
+        # YouTube: list= param or /playlist path
         if host in {"youtube.com", "music.youtube.com", "m.youtube.com"}:
             qs = parse_qs(u.query or "")
             if "list" in qs or (u.path or "").startswith("/playlist"):
                 return True, "youtube"
         if host == "youtu.be":
             qs = parse_qs(u.query or "")
-            if "list" in qs:
-                return True, "youtube"
+            if "list" in qs: return True, "youtube"
+
+        # SoundCloud: /sets/ = playlist
         if "soundcloud.com" in host and "/sets/" in (u.path or ""):
             return True, "soundcloud"
+
+        # Bandcamp: /album/ = multi-track; /track/ = single
+        if "bandcamp.com" in host:
+            if "/album/" in (u.path or ""):
+                return True, "bandcamp"
+            return False, "bandcamp"
+
+        # Spotify playlists not supported
         if host == "open.spotify.com" and "/playlist/" in (u.path or ""):
             return True, "spotify"
+
         return False, "unknown"
     except Exception:
         return False, "unknown"
 
 def ok_domain(link: str) -> bool:
+    """Allow YouTube, SoundCloud, Bandcamp."""
     try:
-        host = urlparse(link).hostname or ""
-        if host.startswith("www."):
-            host = host[4:]
-        return host in ALLOWED_DOMAINS
+        host = (urlparse(link).hostname or "").lower()
+        return (
+            host.endswith("youtube.com") or host == "youtu.be" or
+            host.endswith("soundcloud.com") or
+            host.endswith("bandcamp.com")
+        )
     except Exception:
         return False
 
 def ydl_opts(tmpdir: str, include_thumbs: bool) -> dict:
     """Build yt_dlp options; thumbnails only when requested."""
-    pp = [
-        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-    ]
+    pp = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
     opts = {
         "outtmpl": os.path.join(tmpdir, "%(playlist_index)03d - %(title)s.%(ext)s"),
         "format": "bestaudio/best",
@@ -112,7 +118,7 @@ def ydl_opts(tmpdir: str, include_thumbs: bool) -> dict:
     }
     if include_thumbs:
         opts["writethumbnail"] = True
-        pp.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})  # no exec_cmd used
+        pp.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})  # valid; no exec_cmd
     opts["postprocessors"] = pp
     return opts
 
@@ -123,8 +129,7 @@ def _resolve_outpath(ydl: yt_dlp.YoutubeDL, entry: dict, fallback_exts=("mp3","m
     root, _ = os.path.splitext(base)
     for ext in fallback_exts:
         candidate = f"{root}.{ext}"
-        if os.path.exists(candidate):
-            return candidate
+        if os.path.exists(candidate): return candidate
     return f"{root}.mp3"
 
 def _maybe_thumb_path_from_media_path(media_path: str) -> Optional[str]:
@@ -132,9 +137,20 @@ def _maybe_thumb_path_from_media_path(media_path: str) -> Optional[str]:
     jpg = root + ".jpg"
     return jpg if os.path.exists(jpg) else None
 
+async def probe_playlist_count(link: str) -> Optional[int]:
+    """Try to get playlist length without downloading."""
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "noprogress": True, "extract_flat": True, "yesplaylist": True}) as ydl:
+            info = ydl.extract_info(link, download=False)
+            if isinstance(info, dict) and "entries" in info and info["entries"] is not None:
+                return len([e for e in info["entries"] if e])
+            return None
+    except Exception:
+        return None
+
 async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool) -> Tuple[List[Tuple[str, str]], str, bool, List[Dict], Optional[str]]:
     """
-    Downloads single videos or playlists.
+    Download single or playlist.
     Returns:
       items: [(filepath, display_name)]
       collection_title: str
@@ -152,8 +168,7 @@ async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool) -
         if "entries" in info and info["entries"]:
             title = info.get("title") or "playlist"
             for ent in info["entries"]:
-                if not ent:
-                    continue
+                if not ent: continue
                 path = _resolve_outpath(ydl, ent)
                 track_title = ent.get("title") or "audio"
                 root, _ = os.path.splitext(path)
@@ -163,8 +178,7 @@ async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool) -
 
                 idx = ent.get("playlist_index")
                 thumb = _maybe_thumb_path_from_media_path(final_path) if include_thumbs else None
-                if not cover_path and thumb:
-                    cover_path = thumb
+                if not cover_path and thumb: cover_path = thumb
                 meta.append({"index": idx, "title": track_title, "thumb": thumb})
             return items, title, True, meta, cover_path
         else:
@@ -176,8 +190,7 @@ async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool) -
             items.append((final_path, f"{title}.mp3"))
 
             thumb = _maybe_thumb_path_from_media_path(final_path) if include_thumbs else None
-            if thumb:
-                cover_path = thumb
+            if thumb: cover_path = thumb
             meta.append({"index": None, "title": title, "thumb": thumb})
             return items, title, False, meta, cover_path
 
@@ -185,7 +198,7 @@ def _safe_base(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "playlist"
 
 def make_single_zip(files: List[Tuple[str, str]], out_zip_path: str, *, track_meta: List[Dict], cover_path: Optional[str]):
-    """Create one zip at out_zip_path, including tracks, tracklist.txt, and optional cover image."""
+    """Create one zip at out_zip_path, including tracks, tracklist.txt, and optional artwork image."""
     ordered = sorted(
         enumerate(track_meta),
         key=lambda t: (t[1].get("index") is None, t[1].get("index") or (t[0] + 1))
@@ -197,19 +210,17 @@ def make_single_zip(files: List[Tuple[str, str]], out_zip_path: str, *, track_me
 
     with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for p, display_name in files:
-            try:
-                zf.write(p, arcname=display_name)
-            except FileNotFoundError:
-                continue
+            try: zf.write(p, arcname=display_name)
+            except FileNotFoundError: continue
         zf.writestr("tracklist.txt", tracklist_txt)
         if cover_path and os.path.exists(cover_path):
             ext = pathlib.Path(cover_path).suffix.lower()
-            zf.write(cover_path, arcname=f"cover{ext}")
+            # include as artwork file
+            zf.write(cover_path, arcname=f"artwork{ext}")
 
 def build_attribution(ctx: commands.Context, link: str) -> Optional[str]:
     """Server-only: 'ripped by: Display(Name)(Username) from [Provider](link)'."""
-    if ctx.guild is None:
-        return None
+    if ctx.guild is None: return None
     display = ctx.author.display_name
     uname = ctx.author.name
     provider_pretty, canonical = provider_of(link)
@@ -268,36 +279,9 @@ async def delete_invoke_safely(ctx: commands.Context):
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-# ---------- UI: confirmation views ----------
-class ConfirmZipView(discord.ui.View):
-    """Playlist proceed/cancel; label says 'Zip' as requested."""
-    def __init__(self, author_id: int, *, timeout: float = 30.0):
-        super().__init__(timeout=timeout)
-        self.author_id = author_id
-        self.value: Optional[bool] = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("This prompt isn’t for you.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Zip", style=discord.ButtonStyle.danger)
-    async def proceed(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.value = True
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(content="✅ Proceeding…", view=self)
-        self.stop()
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.value = False
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(content="❎ Cancelled.", view=self)
-        self.stop()
-
+# ---------- Artwork choice ----------
 class ArtChoiceView(discord.ui.View):
-    """Ask whether to include album art (applies to singles and playlists)."""
+    """Ask whether to include Artwork (applies to singles and playlists)."""
     def __init__(self, author_id: int, *, timeout: float = 30.0):
         super().__init__(timeout=timeout)
         self.author_id = author_id
@@ -309,14 +293,14 @@ class ArtChoiceView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Include album art", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Include Artwork", style=discord.ButtonStyle.primary)
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.include_art = True
         for c in self.children: c.disabled = True
-        await interaction.response.edit_message(content="🎨 Including album art…", view=self)
+        await interaction.response.edit_message(content="🖼️ Including Artwork…", view=self)
         self.stop()
 
-    @discord.ui.button(label="No art", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="No Artwork", style=discord.ButtonStyle.secondary)
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.include_art = False
         for c in self.children: c.disabled = True
@@ -338,53 +322,40 @@ async def _help(ctx: commands.Context):
     except discord.HTTPException:
         pass
     finally:
-        try:
-            await msg.delete()
-        except discord.HTTPException:
-            pass
+        try: await msg.delete()
+        except discord.HTTPException: pass
         await delete_invoke_safely(ctx)
 
-async def maybe_confirm_playlist(ctx: commands.Context, link: str) -> Tuple[bool, Optional[str], Optional[discord.Message]]:
-    """Returns (confirmed, provider, prompt_message)."""
+async def maybe_notify_zip(ctx: commands.Context, link: str) -> None:
+    """If playlist length > 5, show a 5s 'will be zipped' notice then delete it."""
     is_pl, provider = detect_playlist(link)
     if not is_pl:
-        return True, None, None
-
+        return
     if provider == "spotify":
         warn = await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False)
         await countdown_delete_message(warn, 5)
-        return False, None, None
+        return
+    count = await probe_playlist_count(link)
+    if count is not None and count > 5:
+        prov_name = "YouTube" if provider == "youtube" else ("SoundCloud" if provider == "soundcloud" else "Bandcamp")
+        notice = await ctx.reply(
+            f"⚠️ Detected a **{prov_name}** playlist with **{count} tracks**.\n"
+            f"It exceeds 5 tracks, so I’ll **zip** the audio.",
+            mention_author=False
+        )
+        await countdown_delete_message(notice, 5)
 
-    view = ConfirmZipView(ctx.author.id, timeout=30)
-    provider_nice = "YouTube" if provider == "youtube" else "SoundCloud"
+async def ask_artwork(ctx: commands.Context) -> Tuple[bool, Optional[discord.Message]]:
+    """Ask once per rip whether to include Artwork."""
+    view = ArtChoiceView(ctx.author.id, timeout=30)
     prompt = await ctx.reply(
-        f"⚠️ Detected a **{provider_nice} playlist**.\n"
-        f"If it has **more than 5 tracks** I'll zip them; **5 or fewer** will be sent as individual files.\n"
-        f"Press **Zip** to continue or Cancel.",
+        "Do you want to include **Artwork**? (If yes, I’ll ZIP audio + artwork together.)",
         view=view, mention_author=False
     )
     await view.wait()
-    if view.value is True:
-        try:
-            await prompt.edit(content="✅ Confirmed. Starting…", view=None)
-        except discord.HTTPException:
-            pass
-        return True, provider, prompt
-    else:
-        try:
-            await prompt.edit(content="❎ Cancelled.", view=None)
-        except discord.HTTPException:
-            pass
-        return False, provider, prompt
-
-async def ask_album_art(ctx: commands.Context) -> Tuple[bool, Optional[discord.Message]]:
-    """Ask once per rip whether to include album art."""
-    view = ArtChoiceView(ctx.author.id, timeout=30)
-    prompt = await ctx.reply("Do you want to include **artwork**? (If yes, I’ll ZIP audio + art together.)", view=view, mention_author=False)
-    await view.wait()
     include = bool(view.include_art)
     try:
-        await prompt.edit(content=("🎨 Artwork will be included." if include else "🎵 Audio only."), view=None)
+        await prompt.edit(content=("🖼️ Artwork will be included." if include else "🎵 Audio only."), view=None)
     except discord.HTTPException:
         pass
     return include, prompt
@@ -399,15 +370,14 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
             warn = await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False)
             await countdown_delete_message(warn, 5)
             return
-        err = await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
+        err = await ctx.reply("Unsupported link. Try YouTube, SoundCloud, or Bandcamp.", mention_author=False)
         await countdown_delete_message(err, 5)
         return
 
-    confirmed, provider, playlist_prompt = await maybe_confirm_playlist(ctx, link)
-    if confirmed is False:
-        return
+    # Playlist notice (if >5)
+    await maybe_notify_zip(ctx, link)
 
-    include_art, art_prompt = await ask_album_art(ctx)
+    include_art, art_prompt = await ask_artwork(ctx)
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     status = await ctx.reply("⏳ Ripping…", mention_author=False)
@@ -415,40 +385,33 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
         items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art)
         attribution = build_attribution(ctx, link)
 
-        # If include_art => always zip (single or playlist)
         if include_art:
-            await status.edit(content=f"🗜️ Zipping audio + album art…")
+            await status.edit(content=f"🗜️ Zipping audio + artwork…")
             safe = _safe_base(title)
             zip_path = os.path.join(tmpdir, f"{safe}.zip")
             make_single_zip(items, zip_path, track_meta=meta, cover_path=cover)
-
             try:
                 if os.path.getsize(zip_path) > MAX_FILE_BYTES_HINT:
                     await status.edit(content="🗜️ Zipping… (note: zip may exceed this server's upload cap)")
             except Exception:
                 pass
-
             await status.edit(content="📤 Uploading zip…")
             await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=False, attribution=attribution)
 
         else:
-            # No art: only zip if playlist and >5 tracks
             if is_pl and len(items) > 5:
                 await status.edit(content=f"🗜️ Zipping… ({len(items)} tracks)")
                 safe = _safe_base(title)
                 zip_path = os.path.join(tmpdir, f"{safe}.zip")
                 make_single_zip(items, zip_path, track_meta=meta, cover_path=None)
-
                 try:
                     if os.path.getsize(zip_path) > MAX_FILE_BYTES_HINT:
                         await status.edit(content="🗜️ Zipping… (note: zip may exceed this server's upload cap)")
                 except Exception:
                     pass
-
                 await status.edit(content="📤 Uploading zip…")
                 await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=False, attribution=attribution)
             else:
-                # Single item or small playlist (≤5): send tracks directly
                 await status.edit(content="📤 Uploading…")
                 if len(items) == 1:
                     p, n = items[0]
@@ -457,28 +420,19 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
                     await send_many_try_one_message_then_fallback(ctx, items, to_dm=False, attribution=attribution)
 
         # Clean up prompts after upload
-        for prompt in (playlist_prompt, art_prompt):
-            if prompt:
-                try:
-                    await prompt.delete()
-                except discord.HTTPException:
-                    pass
+        if art_prompt:
+            try: await art_prompt.delete()
+            except discord.HTTPException: pass
 
-        # Delete invoke after success
         await delete_invoke_safely(ctx)
-
-        try:
-            await status.delete()
-        except discord.HTTPException:
-            pass
+        try: await status.delete()
+        except discord.HTTPException: pass
 
     except Exception as e:
-        try:
-            await status.delete()
-        except discord.HTTPException:
-            pass
+        try: await status.delete()
+        except discord.HTTPException: pass
         err = await ctx.reply(f"❌ Rip failed: `{e}`\n", mention_author=False)
-        await countdown_delete_message(err, 5, prefix="❌ Rip failed. ")
+        await countdown_delete_message(err, 5)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -492,15 +446,12 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
             warn = await ctx.reply("⚠️ Spotify playlists aren’t supported.", mention_author=False)
             await countdown_delete_message(warn, 5)
             return
-        err = await ctx.reply("Unsupported link. Try YouTube or SoundCloud.", mention_author=False)
+        err = await ctx.reply("Unsupported link. Try YouTube, SoundCloud, or Bandcamp.", mention_author=False)
         await countdown_delete_message(err, 5)
         return
 
-    confirmed, provider, playlist_prompt = await maybe_confirm_playlist(ctx, link)
-    if confirmed is False:
-        return
-
-    include_art, art_prompt = await ask_album_art(ctx)
+    await maybe_notify_zip(ctx, link)
+    include_art, art_prompt = await ask_artwork(ctx)
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     status = await ctx.reply("⏳ Ripping…", mention_author=False)
@@ -512,7 +463,6 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
             safe = _safe_base(title)
             zip_path = os.path.join(tmpdir, f"{safe}.zip")
             make_single_zip(items, zip_path, track_meta=meta, cover_path=(cover if include_art else None))
-
             await status.edit(content="📤 Uploading to DM…")
             await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=True, attribution=None)
         else:
@@ -523,26 +473,19 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
             else:
                 await send_many_try_one_message_then_fallback(ctx, items, to_dm=True, attribution=None)
 
-        for prompt in (playlist_prompt, art_prompt):
-            if prompt:
-                try:
-                    await prompt.delete()
-                except discord.HTTPException:
-                    pass
+        if art_prompt:
+            try: await art_prompt.delete()
+            except discord.HTTPException: pass
 
         await delete_invoke_safely(ctx)
+        try: await status.delete()
+        except discord.HTTPException: pass
 
-        try:
-            await status.delete()
-        except discord.HTTPException:
-            pass
     except Exception as e:
-        try:
-            await status.delete()
-        except discord.HTTPException:
-            pass
+        try: await status.delete()
+        except discord.HTTPException: pass
         err = await ctx.reply(f"❌ Rip failed: `{e}`\n", mention_author=False)
-        await countdown_delete_message(err, 5, prefix="❌ Rip failed. ")
+        await countdown_delete_message(err, 5)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
