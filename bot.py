@@ -20,9 +20,13 @@ bot = commands.Bot(command_prefix="*", intents=intents, help_command=None)
 HELP_TEXT = (
     "**ripperRoo — a Discord mp3 ripper created by d-rod**\n"
     "• `*rip <link>` — rip YouTube, SoundCloud, or Bandcamp audio and post it here\n"
-    "• `*ripdm <link>` — rip and DM you the file\n\n"
+    "• `*ripdm <link>` — rip and DM you the file\n"
+    "• `*abort` — abort **your** current rip\n\n"
     "_Tip: to auto-delete your command after sending files, give my role **Manage Messages** in this channel._"
 )
+
+# Track the currently running rip per user (one at a time).
+ACTIVE_RIPS: Dict[int, Dict] = {}
 
 # ---------- small utils ----------
 def human_mb(n: Optional[float]) -> str:
@@ -109,6 +113,7 @@ class ProgressReporter:
         self.t_bytes = 0
 
         self.bar_width = 30  # inside the [ ... ] brackets
+        self.cancelled = False
 
     async def start(self):
         if not self.msg:
@@ -169,9 +174,12 @@ def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter, loop: asyn
     return opts
 
 def make_hook(pr: ProgressReporter, loop: asyncio.AbstractEventLoop):
-    # 'loop' is captured from the MAIN thread where it exists; safe to call from worker thread.
+    # 'loop' is from the main thread; this hook runs in worker thread.
     def hook(d):
         try:
+            if pr.cancelled:
+                # Abort download by raising; caught upstream as a user cancel.
+                raise yt_dlp.utils.DownloadError("User aborted")
             if d.get("status") in ("downloading","finished"):
                 info = d.get("info_dict") or {}
                 t = info.get("title")
@@ -194,8 +202,9 @@ def make_hook(pr: ProgressReporter, loop: asyncio.AbstractEventLoop):
                     loop.call_soon_threadsafe(asyncio.create_task, pr.update())
                 except RuntimeError:
                     pass
-        except Exception:
-            pass
+        except Exception as _:
+            # Re-raise to stop yt_dlp
+            raise
     return hook
 
 def _resolve_outpath(ydl: yt_dlp.YoutubeDL, entry: dict, fallback_exts=("mp3","m4a","webm","opus")) -> str:
@@ -340,7 +349,24 @@ class ArtChoiceView(discord.ui.View):
         for c in self.children: c.disabled = True
         await interaction.response.edit_message(content="🎵 Audio only.", view=self); self.stop()
 
-# ---------- commands ----------
+# ---------- commands & events ----------
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    text_chan = None
+    # Prefer system channel, else first text channel bot can send in
+    if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+        text_chan = guild.system_channel
+    else:
+        for ch in guild.text_channels:
+            if ch.permissions_for(guild.me).send_messages:
+                text_chan = ch
+                break
+    if text_chan:
+        try:
+            await text_chan.send("Thanks for adding me! Please type `*help` for a list of commands.")
+        except discord.HTTPException:
+            pass
+
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
     msg = await ctx.reply(f"{HELP_TEXT}", mention_author=False)
@@ -390,10 +416,32 @@ async def ask_artwork(ctx: commands.Context, *, big_zip: bool) -> Tuple[bool, Op
         pass
     return include, prompt
 
+def user_has_active(uid: int) -> bool:
+    return uid in ACTIVE_RIPS
+
+def clear_active(uid: int):
+    ACTIVE_RIPS.pop(uid, None)
+
+@bot.command(name="abort")
+async def abort(ctx: commands.Context):
+    job = ACTIVE_RIPS.get(ctx.author.id)
+    if not job:
+        msg = await ctx.reply("You don't have an active rip.", mention_author=False)
+        await countdown_delete_message(msg, 5)
+        return
+    # Signal cancel
+    pr: ProgressReporter = job["pr"]
+    pr.cancelled = True
+    msg = await ctx.reply("🛑 Aborting…", mention_author=False)
+    await countdown_delete_message(msg, 5)
+
 @bot.command(name="rip")
 async def rip(ctx: commands.Context, link: Optional[str] = None):
     if not link:
         msg = await ctx.reply("Usage: `*rip <link>`", mention_author=False); await countdown_delete_message(msg, 5); return
+    if user_has_active(ctx.author.id):
+        m = await ctx.reply("You already have a rip running. Use `*abort` to cancel it.", mention_author=False)
+        await countdown_delete_message(m, 5); return
     if not ok_domain(link):
         is_pl, prov = detect_playlist(link)
         if prov == "spotify":
@@ -408,8 +456,14 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
     if est_count and est_count > 0: pr.total_tracks = est_count
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
+    ACTIVE_RIPS[ctx.author.id] = {"pr": pr, "tmpdir": tmpdir}
+
     try:
         items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art, pr=pr)
+
+        if pr.cancelled:
+            # user aborted during or just after download
+            raise yt_dlp.utils.DownloadError("User aborted")
 
         await pr.replace("🗜️ Preparing files…")
 
@@ -448,20 +502,37 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
         except discord.HTTPException: pass
         await delete_invoke_safely(ctx)
 
+    except yt_dlp.utils.DownloadError as e:
+        # Detect explicit user abort
+        if "User aborted" in str(e):
+            try:
+                if pr.msg: await pr.msg.delete()
+            except discord.HTTPException: pass
+            m = await ctx.reply("🛑 Aborted.", mention_author=False)
+            await countdown_delete_message(m, 5)
+        else:
+            try:
+                if pr.msg: await pr.msg.delete()
+            except discord.HTTPException: pass
+            err = await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
+            await countdown_delete_message(err, 5)
     except Exception as e:
         try:
             if pr.msg: await pr.msg.delete()
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException: pass
         err = await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
         await countdown_delete_message(err, 5)
     finally:
+        clear_active(ctx.author.id)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 @bot.command(name="ripdm")
 async def ripdm(ctx: commands.Context, link: Optional[str] = None):
     if not link:
         msg = await ctx.reply("Usage: `*ripdm <link>`", mention_author=False); await countdown_delete_message(msg, 5); return
+    if user_has_active(ctx.author.id):
+        m = await ctx.reply("You already have a rip running. Use `*abort` to cancel it.", mention_author=False)
+        await countdown_delete_message(m, 5); return
     if not ok_domain(link):
         is_pl, prov = detect_playlist(link)
         if prov == "spotify":
@@ -476,8 +547,13 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
     if est_count and est_count > 0: pr.total_tracks = est_count
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
+    ACTIVE_RIPS[ctx.author.id] = {"pr": pr, "tmpdir": tmpdir}
+
     try:
         items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art, pr=pr)
+
+        if pr.cancelled:
+            raise yt_dlp.utils.DownloadError("User aborted")
 
         await pr.replace("🗜️ Preparing files…")
 
@@ -502,14 +578,27 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
         except discord.HTTPException: pass
         await delete_invoke_safely(ctx)
 
+    except yt_dlp.utils.DownloadError as e:
+        if "User aborted" in str(e):
+            try:
+                if pr.msg: await pr.msg.delete()
+            except discord.HTTPException: pass
+            m = await ctx.reply("🛑 Aborted.", mention_author=False)
+            await countdown_delete_message(m, 5)
+        else:
+            try:
+                if pr.msg: await pr.msg.delete()
+            except discord.HTTPException: pass
+            err = await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
+            await countdown_delete_message(err, 5)
     except Exception as e:
         try:
             if pr.msg: await pr.msg.delete()
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException: pass
         err = await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
         await countdown_delete_message(err, 5)
     finally:
+        clear_active(ctx.author.id)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ---------- startup ----------
