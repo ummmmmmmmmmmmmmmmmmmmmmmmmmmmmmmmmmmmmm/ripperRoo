@@ -380,11 +380,11 @@ async def maybe_confirm_playlist(ctx: commands.Context, link: str) -> Tuple[bool
 async def ask_album_art(ctx: commands.Context) -> Tuple[bool, Optional[discord.Message]]:
     """Ask once per rip whether to include album art."""
     view = ArtChoiceView(ctx.author.id, timeout=30)
-    prompt = await ctx.reply("Do you want to include **album art**? (If yes, I’ll ZIP audio + art together.)", view=view, mention_author=False)
+    prompt = await ctx.reply("Do you want to include **artwork**? (If yes, I’ll ZIP audio + art together.)", view=view, mention_author=False)
     await view.wait()
     include = bool(view.include_art)
     try:
-        await prompt.edit(content=("🎨 Album art will be included." if include else "🎵 Audio only."), view=None)
+        await prompt.edit(content=("🎨 Artwork will be included." if include else "🎵 Audio only."), view=None)
     except discord.HTTPException:
         pass
     return include, prompt
