@@ -1,5 +1,5 @@
 # bot.py
-import os, re, tempfile, asyncio, shutil, zipfile, pathlib, math, time
+import os, re, tempfile, asyncio, shutil, zipfile, pathlib, time, random
 from typing import Optional, Tuple, List, Dict
 from urllib.parse import urlparse, parse_qs
 
@@ -26,8 +26,10 @@ HELP_TEXT = (
 
 # ---------- small utils ----------
 def human_mb(n: Optional[float]) -> str:
-    if not n: return "0 MB"
-    return f"{n/1024/1024:.1f} MB"
+    try:
+        return f"{(n or 0)/1024/1024:.1f} MB"
+    except Exception:
+        return "0 MB"
 
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
@@ -90,14 +92,15 @@ async def countdown_delete_message(msg: discord.Message, seconds: int = 5):
         try: await msg.delete()
         except discord.HTTPException: pass
 
-# ---------- progress reporting ----------
+# ---------- progress reporting with musical bar ----------
+NOTE_GLYPHS = ["𝆕","𝅘𝅥","𝅗𝅥","𝅘𝅥𝅮","♩","♪","♫","♬"]
+
 class ProgressReporter:
     def __init__(self, ctx: commands.Context):
         self.ctx = ctx
         self.msg: Optional[discord.Message] = None
         self._last_edit = 0.0
 
-        # these are set by the hook/invoker
         self.total_tracks = 1
         self.current_index = 1
         self.current_title = ""
@@ -105,32 +108,43 @@ class ProgressReporter:
         self.d_bytes = 0
         self.t_bytes = 0
 
+        self.bar_width = 30  # inside the [ ... ] brackets
+
     async def start(self):
         if not self.msg:
             self.msg = await self.ctx.reply("⏳ Ripping…", mention_author=False)
 
+    def _music_bar(self) -> str:
+        filled = clamp(int(round(self.percent/100 * self.bar_width)), 0, self.bar_width)
+        # Randomize glyphs each update so it "shimmers"
+        notes = "".join(random.choice(NOTE_GLYPHS) for _ in range(filled))
+        rest  = "-" * (self.bar_width - filled)
+        return f"[{notes}{rest}]"
+
     async def update(self, force: bool=False):
         if not self.msg: return
         now = time.time()
-        if not force and now - self._last_edit < 0.6:  # throttle a bit
+        if not force and now - self._last_edit < 0.45:  # throttle to avoid rate limits
             return
         self._last_edit = now
-        blocks = 10
-        filled = int(round(self.percent/100*blocks))
-        bar = "█"*filled + "░"*(blocks-filled)
+
         title = (self.current_title or "").strip()
         title = title if len(title) <= 70 else title[:67]+"…"
         header = f"[{self.current_index}/{self.total_tracks}] {title}"
-        size = f"{human_mb(self.d_bytes)}"
+
         if self.t_bytes:
-            size += f" / {human_mb(self.t_bytes)}"
-        content = f"{header} — {self.percent:>3d}% {bar}\n"
+            size = f"{human_mb(self.d_bytes)} / {human_mb(self.t_bytes)}"
+        else:
+            size = f"{human_mb(self.d_bytes)}"
+
+        bar = self._music_bar()
+        content = f"{header}\nRIPPING {bar} {self.percent:>3d}% ({size})"
         try:
             await self.msg.edit(content=content)
         except discord.HTTPException:
             pass
 
-    async def done_and_replace(self, text: str):
+    async def replace(self, text: str):
         if not self.msg:
             self.msg = await self.ctx.reply(text, mention_author=False)
         else:
@@ -156,30 +170,29 @@ def ydl_opts(tmpdir: str, include_thumbs: bool, pr: ProgressReporter) -> dict:
     return opts
 
 def make_hook(pr: ProgressReporter):
-    async def _async_update():
-        await pr.update()
+    loop = asyncio.get_event_loop()
     def hook(d):
         try:
             if d.get("status") in ("downloading","finished"):
                 info = d.get("info_dict") or {}
-                pr.current_title = info.get("title") or pr.current_title
+                t = info.get("title")
+                if t: pr.current_title = t
                 idx = info.get("playlist_index")
                 if idx: pr.current_index = int(idx)
-                if "downloaded_bytes" in d:
-                    pr.d_bytes = int(d["downloaded_bytes"] or 0)
-                t = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                pr.t_bytes = int(t or 0)
+
+                pr.d_bytes = int(d.get("downloaded_bytes") or 0)
+                tbytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                pr.t_bytes = int(tbytes or 0)
                 if pr.t_bytes:
                     pr.percent = clamp(int(pr.d_bytes * 100 / pr.t_bytes), 0, 100)
-                elif d.get("elapsed") and d.get("speed"):
-                    # rough fallback if total unknown
-                    pr.percent = clamp(int((d["elapsed"] % 5) * 20), 0, 99)
+                else:
+                    pr.percent = min(99, pr.percent + 1)  # rough fallback
+
                 if d.get("status") == "finished":
                     pr.percent = 100
-                # schedule async update (yt_dlp hook is sync)
+
                 try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(pr.update())
+                    loop.call_soon_threadsafe(asyncio.create_task, pr.update())
                 except RuntimeError:
                     pass
         except Exception:
@@ -212,42 +225,43 @@ async def probe_playlist_count(link: str) -> Optional[int]:
     return None
 
 async def download_all_to_mp3(link: str, tmpdir: str, *, include_thumbs: bool, pr: ProgressReporter) -> Tuple[List[Tuple[str,str]], str, bool, List[Dict], Optional[str]]:
+    """Run yt_dlp in a worker thread so our progress bar can update live."""
+    def do_download():
+        with yt_dlp.YoutubeDL(ydl_opts(tmpdir, include_thumbs, pr)) as ydl:
+            info = ydl.extract_info(link, download=True)
+            return info, ydl
+    info, ydl = await asyncio.to_thread(do_download)
+
     items: List[Tuple[str,str]] = []
     meta: List[Dict] = []
     cover: Optional[str] = None
-    with yt_dlp.YoutubeDL(ydl_opts(tmpdir, include_thumbs, pr)) as ydl:
-        info = ydl.extract_info(link, download=True)
 
-        if "entries" in info and info["entries"]:
-            title = info.get("title") or "playlist"
-            total = len([e for e in info["entries"] if e])
-            pr.total_tracks = total or 1
-            for ent in info["entries"]:
-                if not ent: continue
-                path = _resolve_outpath(ydl, ent)
-                ttitle = ent.get("title") or "audio"
-                root,_ = os.path.splitext(path)
-                mp3 = root + ".mp3"
-                final = mp3 if os.path.exists(mp3) else path
-                items.append((final, f"{ttitle}.mp3"))
-                idx = ent.get("playlist_index")
-                thumb = _maybe_thumb_path_from_media_path(final) if include_thumbs else None
-                if not cover and thumb: cover = thumb
-                meta.append({"index": idx, "title": ttitle, "thumb": thumb})
-            return items, title, True, meta, cover
-        else:
-            title = info.get("title") or "audio"
-            path = _resolve_outpath(ydl, info)
+    if "entries" in info and info["entries"]:
+        title = info.get("title") or "playlist"
+        for ent in info["entries"]:
+            if not ent: continue
+            path = _resolve_outpath(ydl, ent)
+            ttitle = ent.get("title") or "audio"
             root,_ = os.path.splitext(path)
             mp3 = root + ".mp3"
             final = mp3 if os.path.exists(mp3) else path
-            items.append((final, f"{title}.mp3"))
+            items.append((final, f"{ttitle}.mp3"))
+            idx = ent.get("playlist_index")
             thumb = _maybe_thumb_path_from_media_path(final) if include_thumbs else None
-            meta.append({"index": None, "title": title, "thumb": thumb})
-            if thumb: cover = thumb
-            pr.total_tracks = 1
-            pr.current_index = 1
-            return items, title, False, meta, cover
+            if not cover and thumb: cover = thumb
+            meta.append({"index": idx, "title": ttitle, "thumb": thumb})
+        return items, title, True, meta, cover
+    else:
+        title = info.get("title") or "audio"
+        path = _resolve_outpath(ydl, info)
+        root,_ = os.path.splitext(path)
+        mp3 = root + ".mp3"
+        final = mp3 if os.path.exists(mp3) else path
+        items.append((final, f"{title}.mp3"))
+        thumb = _maybe_thumb_path_from_media_path(final) if include_thumbs else None
+        if thumb: cover = thumb
+        meta.append({"index": None, "title": title, "thumb": thumb})
+        return items, title, False, meta, cover
 
 # ---------- zipping / attribution ----------
 def make_single_zip(files: List[Tuple[str,str]], out_zip: str, *, track_meta: List[Dict], cover_path: Optional[str]):
@@ -329,8 +343,7 @@ class ArtChoiceView(discord.ui.View):
 async def _help(ctx: commands.Context):
     msg = await ctx.reply(f"{HELP_TEXT}", mention_author=False)
     await countdown_delete_message(msg, 5)
-    try: await ctx.message.delete()
-    except (discord.Forbidden, discord.HTTPException): pass
+    await delete_invoke_safely(ctx)
 
 async def maybe_notify_zip(ctx: commands.Context, link: str) -> None:
     is_pl, provider = detect_playlist(link)
@@ -349,7 +362,6 @@ async def ask_artwork(ctx: commands.Context) -> Tuple[bool, Optional[discord.Mes
     view = ArtChoiceView(ctx.author.id, timeout=30)
     prompt = await ctx.reply("Do you want to include **Artwork**? (If yes, I’ll ZIP audio + artwork together.)", view=view, mention_author=False)
     await view.wait()
-    # if user ignores, default to False
     include = bool(view.include_art)
     try: await prompt.edit(content=("🖼️ Artwork will be included." if include else "🎵 Audio only."), view=None)
     except discord.HTTPException: pass
@@ -369,15 +381,16 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
     include_art, art_prompt = await ask_artwork(ctx)
 
     pr = ProgressReporter(ctx); await pr.start()
+    est_count = await probe_playlist_count(link)
+    if est_count and est_count > 0: pr.total_tracks = est_count
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     try:
         items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art, pr=pr)
 
-        attribution = build_attribution(ctx, link)
+        await pr.replace("🗜️ Preparing files…")
 
-        # After downloads complete, replace progress with next status
-        await pr.done_and_replace("🗜️ Preparing files…")
+        attribution = build_attribution(ctx, link)
 
         if include_art:
             safe = _safe_base(title)
@@ -385,27 +398,26 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
             make_single_zip(items, zip_path, track_meta=meta, cover_path=cover)
             try:
                 if os.path.getsize(zip_path) > MAX_FILE_BYTES_HINT:
-                    await pr.msg.edit(content="🗜️ Preparing files… (note: zip may exceed this server's upload cap)")
+                    await pr.replace("🗜️ Preparing files… (note: zip may exceed this server's upload cap)")
             except Exception:
                 pass
-            await pr.msg.edit(content="📤 Uploading zip…")
+            await pr.replace("📤 Uploading zip…")
             await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=False, attribution=attribution)
         else:
             if is_pl and len(items) > 5:
                 safe = _safe_base(title)
                 zip_path = os.path.join(tmpdir, f"{safe}.zip")
                 make_single_zip(items, zip_path, track_meta=meta, cover_path=None)
-                await pr.msg.edit(content="📤 Uploading zip…")
+                await pr.replace("📤 Uploading zip…")
                 await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=False, attribution=attribution)
             else:
-                await pr.msg.edit(content="📤 Uploading…")
+                await pr.replace("📤 Uploading…")
                 if len(items) == 1:
                     p,n = items[0]
                     await send_single_file_with_banner(ctx, p, n, to_dm=False, attribution=attribution)
                 else:
                     await send_many_try_one_message_then_fallback(ctx, items, to_dm=False, attribution=attribution)
 
-        # cleanup prompts + progress message
         if art_prompt:
             try: await art_prompt.delete()
             except discord.HTTPException: pass
@@ -414,10 +426,8 @@ async def rip(ctx: commands.Context, link: Optional[str] = None):
         await delete_invoke_safely(ctx)
 
     except Exception as e:
-        # keep the error text visible + countdown
         try:
-            if pr.msg:
-                await pr.msg.delete()
+            if pr.msg: await pr.msg.delete()
         except discord.HTTPException:
             pass
         err = await ctx.reply(f"❌ Rip failed: `{e}`", mention_author=False)
@@ -439,21 +449,23 @@ async def ripdm(ctx: commands.Context, link: Optional[str] = None):
     include_art, art_prompt = await ask_artwork(ctx)
 
     pr = ProgressReporter(ctx); await pr.start()
+    est_count = await probe_playlist_count(link)
+    if est_count and est_count > 0: pr.total_tracks = est_count
 
     tmpdir = tempfile.mkdtemp(prefix="rip-")
     try:
         items, title, is_pl, meta, cover = await download_all_to_mp3(link, tmpdir, include_thumbs=include_art, pr=pr)
 
-        await pr.done_and_replace("🗜️ Preparing files…")
+        await pr.replace("🗜️ Preparing files…")
 
         if include_art or (is_pl and len(items) > 5):
             safe = _safe_base(title)
             zip_path = os.path.join(tmpdir, f"{safe}.zip")
             make_single_zip(items, zip_path, track_meta=meta, cover_path=(cover if include_art else None))
-            await pr.msg.edit(content="📤 Uploading to DM…")
+            await pr.replace("📤 Uploading to DM…")
             await send_single_file_with_banner(ctx, zip_path, os.path.basename(zip_path), to_dm=True, attribution=None)
         else:
-            await pr.msg.edit(content="📤 Uploading to DM…")
+            await pr.replace("📤 Uploading to DM…")
             if len(items) == 1:
                 p,n = items[0]
                 await send_single_file_with_banner(ctx, p, n, to_dm=True, attribution=None)
