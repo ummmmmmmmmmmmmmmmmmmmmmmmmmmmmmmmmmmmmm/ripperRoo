@@ -1,4 +1,4 @@
-import discord, asyncio, os, tempfile, yt_dlp
+import discord, asyncio, os, tempfile, yt_dlp, time
 from datetime import datetime
 from ui_components import ArtChoice, ZipChoice
 from utils import progress_bar, validate_link, zip_folder, clean_dir
@@ -13,12 +13,11 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     ephemeral = await interaction.followup.send("✅ Received. Checking link...", ephemeral=True)
 
-    # ---- validate domain ----
     if not validate_link(link, ALLOWED_DOMAINS):
         await ephemeral.edit(content="❌ Unsupported or invalid link.")
         return
 
-    # ---- ask for album art ----
+    # Ask for album art
     art_view = ArtChoice()
     await ephemeral.edit(content="🎨 Include album art?", view=art_view)
     await art_view.wait()
@@ -27,62 +26,77 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}."
     )
 
-    # ---- public notice ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
-    # ---- create isolated temp folder ----
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
-
-    # ---- capture main event loop ----
     loop = asyncio.get_running_loop()
 
-    # ---- progress hook closure ----
+    # ----------------------------------------------------------
+    # Progress Hook — sends updates to Discord (throttled)
+    # ----------------------------------------------------------
+    last_update = {"time": 0}
+
     def progress_hook(d):
+        now = time.time()
+        # limit updates to every 0.5s to prevent Discord spam
+        if now - last_update["time"] < 0.5:
+            return
+        last_update["time"] = now
         asyncio.run_coroutine_threadsafe(on_progress(d, ephemeral), loop)
 
-    # ---- yt-dlp config ----
+    # ----------------------------------------------------------
+    # yt-dlp Config
+    # ----------------------------------------------------------
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
-        "quiet": True,
+        "quiet": True,                      # fully suppress console output
+        "no_warnings": True,
+        "progress_with_newline": False,     # stops terminal progress
         "ignoreerrors": True,
         "noplaylist": False,
         "writethumbnail": include_art,
         "skip_download": False,
-        "concurrent_fragment_downloads": 5,     # 🚀 boost speed (multi-threaded fragments)
-        "retries": 5,                           # retry on slow connections
+        "concurrent_fragment_downloads": 5,
+        "retries": 5,
         "fragment_retries": 5,
-        "buffersize": 64 * 1024,                # larger buffer for smoother downloads
-        "continuedl": True,                     # resume partial downloads
+        "buffersize": 128 * 1024,
+        "continuedl": True,
         "socket_timeout": 10,
+        "progress_hooks": [progress_hook],
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
         ],
-        "progress_hooks": [progress_hook],
     }
 
+    # ----------------------------------------------------------
+    # Fetch Info (playlist detection)
+    # ----------------------------------------------------------
     await ephemeral.edit(content="🎵 Fetching playlist info...")
     info = await asyncio.to_thread(extract_info, link, ydl_opts)
     entries = info.get("entries", [info]) if info else []
     total = len(entries)
     await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
 
-    # ---- optimize art downloads ----
+    # Shared album art optimization
     if include_art and total > 1:
-        ydl_opts["writethumbnail"] = False  # disable per-track art download
+        ydl_opts["writethumbnail"] = False
         await ephemeral.edit(content="🎨 Downloading shared album art...")
-        # download one thumbnail manually for the first track
         first_thumb = info["entries"][0].get("thumbnail")
         if first_thumb:
             thumb_path = os.path.join(session_dir, "album_art.jpg")
             await asyncio.to_thread(download_file, first_thumb, thumb_path)
             await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
 
-    # ---- rip audio ----
+    # ----------------------------------------------------------
+    # Run yt-dlp in async thread (real downloads)
+    # ----------------------------------------------------------
     await asyncio.to_thread(run_ytdlp, link, ydl_opts)
-    await asyncio.sleep(0.5)  # let yt-dlp close file handles
+    await asyncio.sleep(0.5)
 
-    # ---- collect MP3s ----
+    # ----------------------------------------------------------
+    # Gather results
+    # ----------------------------------------------------------
     files = [os.path.join(session_dir, f) for f in os.listdir(session_dir) if f.endswith(".mp3")]
     total_done = len(files)
     if total_done == 0:
@@ -90,7 +104,9 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         clean_dir(session_dir)
         return
 
-    # ---- zip logic ----
+    # ----------------------------------------------------------
+    # Zipping Logic
+    # ----------------------------------------------------------
     zip_mode = total_done > 10
     if 5 < total_done <= 10:
         zip_view = ZipChoice()
@@ -98,7 +114,9 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         await zip_view.wait()
         zip_mode = zip_view.choice or False
 
-    # ---- upload results ----
+    # ----------------------------------------------------------
+    # Uploads
+    # ----------------------------------------------------------
     if zip_mode:
         await ephemeral.edit(content="📦 Zipping files...")
         zip_path = zip_folder(session_dir)
@@ -148,10 +166,11 @@ def extract_info(link, opts):
         return ydl.extract_info(link, download=False)
 
 async def on_progress(d, ephemeral_msg):
-    """Live progress with clean Discord-safe bar + ETA + bitrate."""
+    """Live progress bar with ETA + bitrate."""
     if d["status"] == "downloading":
         filename = d.get("filename", "unknown")
         title = os.path.splitext(os.path.basename(filename))[0]
+
         percent = d.get("_percent_str", "0.0%").replace("%", "")
         try:
             progress = float(percent) / 100
@@ -164,17 +183,15 @@ async def on_progress(d, ephemeral_msg):
         bitrate_text = f"{abr} kbps"
 
         bar = progress_bar(progress)
-        text = (
-            f"🎶 **{title}**\n"
-            f"{bar} `{int(progress * 100)}%`  {eta_text}  `{bitrate_text}`"
-        )
+        text = f"🎶 **{title}**\n{bar} `{int(progress*100)}%`  {eta_text}  `{bitrate_text}`"
+
         try:
             await ephemeral_msg.edit(content=text)
         except Exception:
             pass
 
 def download_file(url: str, path: str):
-    """Download a file (like album art) manually using requests."""
+    """Simple file download for album art."""
     import requests
     r = requests.get(url, stream=True, timeout=10)
     if r.status_code == 200:
