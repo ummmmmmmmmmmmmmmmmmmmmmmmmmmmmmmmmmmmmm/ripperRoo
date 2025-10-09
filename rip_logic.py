@@ -1,15 +1,15 @@
 # rip_logic.py
 import discord, asyncio, os, tempfile, yt_dlp, time, zipfile, re, json
-from ui_components import ArtChoice, ZipChoice
+from ui_components import ArtChoice
 from utils import validate_link, clean_dir
 from config import ALLOWED_DOMAINS
 
 TARGET_ABR = 192   # kbps
-BAR_LEN     = 50   # progress bar width
+BAR_LEN     = 50
 FILLED_CHAR = "♪"
 EMPTY_CHAR  = "-"
 
-# -------------------- Quiet logger for yt-dlp (no terminal progress) --------------------
+# -------------------- Quiet logger for yt-dlp --------------------
 class _QuietLogger:
     def debug(self, msg):  # swallow progress lines
         pass
@@ -20,7 +20,7 @@ class _QuietLogger:
     def error(self, msg):
         print(msg)
 
-# -------------------- helpers: safe names & rendering --------------------
+# -------------------- helpers: names & rendering --------------------
 SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9 \-_.]+")
 
 def safe_name(s: str, maxlen: int = 80) -> str:
@@ -201,22 +201,24 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             await asyncio.sleep(0.35)
     init_task = asyncio.create_task(init_anim())
 
-    # ---- public animated header (jumping kangaroo + counter) ----
-    public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio… 🦘")
-    public_state = {"dots": 0, "completed": 0, "total": None, "active": True, "runner_pos": 0, "frame": 0}
-    TRACK_LEN = 18
+    # ---- public animated header (jumping kangaroo RIGHT→LEFT) ----
+    public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio…")
+    public_state = {"dots": 0, "completed": 0, "total": None, "active": True, "runner_pos": 17, "frame": 0}
+    TRACK_LEN = 18  # width of the runner lane
+
     def make_runner_line():
+        # right-to-left motion
         pos = public_state["runner_pos"] % TRACK_LEN
         jump = (public_state["frame"] % 2 == 1)
         ground = "-" * TRACK_LEN
         sprite = "🦘" if not jump else "ᴗ🦘"
         line = list(ground)
-        # place sprite bounded
-        if 0 <= pos < TRACK_LEN:
-            line[pos] = " "
+        # Put sprite near pos from the RIGHT edge
+        idx = TRACK_LEN - 1 - pos
+        if 0 <= idx < TRACK_LEN:
+            line[idx] = " "
         runner = "".join(line)
-        # show as code line for monospacing
-        return f"`{runner[:pos]}{sprite}{runner[pos+1:]}`"
+        return f"`{runner[:idx]}{sprite}{runner[idx+1:]}`"
 
     async def public_anim():
         while public_state["active"]:
@@ -224,9 +226,9 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             total = public_state["total"]
             runner = make_runner_line()
             if total is None:
-                text = f"{interaction.user.mention} is ripping audio{dots} {runner} 🦘"
+                text = f"{interaction.user.mention} is ripping audio{dots} {runner}"
             else:
-                text = f"{interaction.user.mention} is ripping audio{dots} ({public_state['completed']}/{total}) {runner} 🦘"
+                text = f"{interaction.user.mention} is ripping audio{dots} ({public_state['completed']}/{total}) {runner}"
             try:
                 await public_msg.edit(content=text)
             except Exception:
@@ -235,6 +237,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             public_state["runner_pos"] += 1
             public_state["frame"] += 1
             await asyncio.sleep(0.95)
+
     public_task = asyncio.create_task(public_anim())
 
     # ---- temp working folder ----
@@ -248,16 +251,16 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "total": None,
         "eta": None,
         "abr": TARGET_ABR,
-        "speed": None,        # bytes/sec
-        "p01": 0.0,           # 0..1
-        "status": "idle",     # downloading | postprocessing | finished
+        "speed": None,
+        "p01": 0.0,
+        "status": "idle",
         "active": True,
         "last_ts": time.monotonic(),
     }
     download_counters = {"ok": 0, "skipped": 0}
 
     async def animator():
-        tick = 0.13  # ~7–8 fps
+        tick = 0.13
         while state["active"]:
             try:
                 p = state["p01"]
@@ -307,17 +310,21 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 if p01 is not None:
                     state["p01"] = p01
                 state["last_ts"] = time.monotonic()
+
             elif status == "postprocessing":
                 state["status"] = "postprocessing"
                 state["eta"] = None
+
             elif status == "finished":
                 state["status"] = "finished"
                 state["p01"] = 1.0
                 state["eta"] = 0
                 public_state["completed"] += 1
                 download_counters["ok"] += 1
+
             elif status == "error":
                 download_counters["skipped"] += 1
+
         loop.call_soon_threadsafe(upd)
 
     # ---- yt-dlp options (robust for YT playlists) ----
@@ -348,7 +355,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     }
 
     # ---- fetch info (playlist size & shared art) ----
-    info = await asyncio.to_thread(extract_info, link, ydl_opts)  # may be None
+    info = await asyncio.to_thread(extract_info, link, ydl_opts)
 
     # stop "Initializing..."
     init_active = False
@@ -392,7 +399,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     files.sort()
     total_done = len(files)
 
-    # Info for skipped items
     if total and total_done < total:
         skipped = total - total_done
         try:
@@ -433,7 +439,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         clean_dir(session_dir)
         return
 
-    # ---- close public header animator ----
+    # ---- close public header ----
     public_state["active"] = False
     try:
         await public_task
@@ -447,39 +453,43 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     elapsed = int(time.monotonic() - start_ts)
     mins, secs = divmod(elapsed, 60)
     elapsed_text = f"{mins:02d}:{secs:02d}"
-    source_md = f"[Source]({link})"
 
-    # ---- ALWAYS attach zips on the SAME final message ----
+    # Suppress rich preview: wrap link in <…> so attachment stays visible
+    source_md = f"[Source](<{link}>)"
+
+    # ---- FINAL SUMMARY (no kangaroo here) + ALWAYS attach zip(s) on THIS message ----
     summary_content = (
         f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-        f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘 — **Download below ⤵️**"
+        f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} — **Download below ⤵️**"
     )
 
-    async def send_summary_with_files():
-        # try to attach ALL parts first (Discord allows up to 10 files/message)
-        for k in range(len(parts), 0, -1):
+    async def send_summary_with_files_always():
+        # 1) Try to send all parts (<=10 per message)
+        for k in range(min(len(parts), 10), 0, -1):
             try:
                 files_to_send = [discord.File(p) for p in parts[:k]]
                 return await interaction.channel.send(content=summary_content, files=files_to_send)
             except Exception:
                 continue
-        # absolute fallback: attach at least Part 1 (fresh handle) or send text
+        # 2) Try at least Part 1
         try:
             return await interaction.channel.send(content=summary_content, file=discord.File(parts[0]))
         except Exception:
-            return await interaction.channel.send(content=summary_content)
+            # 3) As a last resort, send text only and immediately reply with Part 1
+            txt = await interaction.channel.send(content=summary_content)
+            try:
+                await interaction.channel.send(file=discord.File(parts[0]), reference=txt)
+            except Exception:
+                pass
+            return txt
 
-    summary_msg = await send_summary_with_files()
+    summary_msg = await send_summary_with_files_always()
 
-    # If not all parts fit in one message, post the remainder as a reply (rare)
-    if summary_msg and len(parts) > 10:
+    # If more than 10 parts, send overflow as replies (Discord limit)
+    if len(parts) > 10:
         for zp in parts[10:]:
             try:
-                await interaction.channel.send(
-                    content=None,
-                    file=discord.File(zp),
-                    reference=summary_msg
-                )
+                await interaction.channel.send(file=discord.File(zp), reference=summary_msg)
             except Exception:
                 pass
             await asyncio.sleep(0.25)
