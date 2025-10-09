@@ -14,6 +14,8 @@ def build_ydl_opts(
     include_art: bool,
     progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
     format_str: Optional[str] = None,
+    use_pp_mp3: bool = False,
+    abr_kbps: int = 192,
 ):
     hooks = [progress_hook] if progress_hook else []
     fmt = format_str or YTDLP_FORMAT_PRIMARY
@@ -26,7 +28,7 @@ def build_ydl_opts(
         "no_warnings": True,
 
         # robustness
-        "ignoreerrors": "only_download",   # skip bad entries but continue playlist
+        "ignoreerrors": "only_download",   # skip broken entries, keep ripping
         "ignore_no_formats_error": True,
         "extractor_retries": 3,
         "skip_unavailable_fragments": True,
@@ -37,20 +39,28 @@ def build_ydl_opts(
         "socket_timeout": 10,
         "geo_bypass": True,
 
-        # playlists and art
+        # playlists & art
         "noplaylist": False,
         "writethumbnail": include_art,
         "skip_download": False,
 
         "progress_hooks": hooks,
 
-        # Often helps YouTube when desktop player lists are odd
+        # Often helps YouTube when desktop player formats are odd
         "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
 
-    # Optional cookies (fixes age/region blocks)
+    # Optional cookies (fix age/region blocks)
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
+
+    # Let yt-dlp run ffmpeg to MP3 directly
+    if use_pp_mp3:
+        opts["postprocessors"] = [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(abr_kbps)},
+            {"key": "FFmpegMetadata"},
+        ]
+        opts["keepvideo"] = False
 
     return opts
 
@@ -63,6 +73,8 @@ def extract_info(url: str, out_dir: str, include_art: bool, format_str: Optional
 
 def download_all(url: str, out_dir: str, include_art: bool,
                  progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
-                 format_str: Optional[str] = None) -> None:
-    with yt_dlp.YoutubeDL(build_ydl_opts(out_dir, include_art, progress_hook, format_str=format_str)) as ydl:
+                 format_str: Optional[str] = None,
+                 use_pp_mp3: bool = False,
+                 abr_kbps: int = 192) -> None:
+    with yt_dlp.YoutubeDL(build_ydl_opts(out_dir, include_art, progress_hook, format_str, use_pp_mp3, abr_kbps)) as ydl:
         ydl.download([url])

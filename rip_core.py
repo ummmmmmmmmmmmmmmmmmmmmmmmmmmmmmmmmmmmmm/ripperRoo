@@ -1,9 +1,11 @@
 # rip_core.py
 import os, tempfile, time, json
 from typing import Dict, Any, List, Optional
-from constants import TARGET_ABR_KBPS, DEFAULT_ZIP_PART_MB, YTDLP_FORMAT_FALLBACK
+from constants import (
+    TARGET_ABR_KBPS, DEFAULT_ZIP_PART_MB,
+    YTDLP_FORMAT_FALLBACK,
+)
 from ytdlp_wrapper import extract_info, download_all
-from ffmpeg_utils import transcode_to_mp3, embed_art_in_mp3
 from packager import build_zip_parts
 
 def _hmmss(sec: int | float | None) -> str:
@@ -94,73 +96,55 @@ def rip_to_zips(
     zip_part_limit_bytes: int = DEFAULT_ZIP_PART_MB * 1024 * 1024,
 ) -> Dict[str, Any]:
     """
-    Downloads (playlist-safe), ffmpeg-transcodes to MP3, embeds art (optional),
-    writes docs, and zips into parts <= zip_part_limit_bytes.
+    Downloads (playlist-safe) with yt-dlp, converts to MP3 (yt-dlp ffmpeg pp),
+    writes docs, zips into parts <= zip_part_limit_bytes.
     """
-    t0 = time.monotonic()
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
 
-    # Probe info for naming/tracklist
+    # Probe info for naming/tracklist (non-fatal)
     info = extract_info(url, session_dir, include_art)
 
-    # First pass download (preferred formats)
-    download_all(url, session_dir, include_art)
+    # PASS 1: strict format chain + yt-dlp postprocessor → MP3
+    download_all(url, session_dir, include_art,
+                 progress_hook=None,
+                 format_str=None,
+                 use_pp_mp3=True,
+                 abr_kbps=TARGET_ABR_KBPS)
 
-    # Collect any audio-like files
-    raw_files = _collect_audio_files(session_dir)
+    files = _collect_audio_files(session_dir)
 
-    # SECOND-CHANCE: If nothing grabbed (blocked formats), retry with broader format
-    if not raw_files:
-        download_all(url, session_dir, include_art, format_str=YTDLP_FORMAT_FALLBACK)
-        raw_files = _collect_audio_files(session_dir)
+    # PASS 2: if nothing was created, retry with a very loose format
+    if not files:
+        download_all(url, session_dir, include_art,
+                     progress_hook=None,
+                     format_str=YTDLP_FORMAT_FALLBACK,
+                     use_pp_mp3=True,
+                     abr_kbps=TARGET_ABR_KBPS)
+        files = _collect_audio_files(session_dir)
 
-    if not raw_files:
+    if not files:
         raise RuntimeError("No audio files were downloaded (all items unavailable?).")
 
-    # Transcode everything to MP3 via FFmpeg
-    mp3_files: List[str] = []
-    for src in raw_files:
-        root, ext = os.path.splitext(src)
-        dst = root + ".mp3"
-        if ext.lower() == ".mp3":
-            mp3_files.append(src)
-        else:
-            transcode_to_mp3(src, dst)
-            mp3_files.append(dst)
-
-    # Embed shared art if present and requested
-    if include_art:
-        art = None
-        for name in os.listdir(session_dir):
-            if os.path.splitext(name)[1].lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-                art = os.path.join(session_dir, name)
-                break
-        if art:
-            for mp3 in mp3_files:
-                try: embed_art_in_mp3(mp3, art)
-                except Exception: pass  # non-fatal
-
     # Docs + playlist
-    docs = _write_docs(session_dir, info, mp3_files)
+    docs = _write_docs(session_dir, info, files)
 
     # Zip parts
     zip_base = _derive_zip_basename(info)
-    zips = build_zip_parts(mp3_files, session_dir, zip_base, zip_part_limit_bytes, extra_first=docs)
+    zips = build_zip_parts(files, session_dir, zip_base, zip_part_limit_bytes, extra_first=docs)
     if not zips:
-        biggest = max((os.path.getsize(f), f) for f in mp3_files)[1]
+        biggest = max((os.path.getsize(f), f) for f in files)[1]
         raise RuntimeError(f"Track too large for part limit: {os.path.basename(biggest)}")
 
-    # Duration (best-effort sum of entry durations)
-    entries = _normalize_entries(info)
+    # Duration (best-effort: sum entry durations)
     total_sec = 0
-    for e in entries:
+    for e in _normalize_entries(info):
         if e and e.get("duration"):
             total_sec += int(e["duration"])
     dur_hmmss = _hmmss(total_sec if total_sec > 0 else None)
 
     return {
         "zips": zips,
-        "count": len(mp3_files),
+        "count": len(files),
         "duration_hmmss": dur_hmmss,
         "bitrate": TARGET_ABR_KBPS,
         "zip_base": zip_base,
