@@ -16,15 +16,24 @@ class _QuietLogger:
     def error(self, msg):
         print(msg)
 
-# -------------------- Discord-safe ASCII progress (monospace) --------------------
+# -------------------- Discord-safe progress blocks --------------------
+_BAR_LEN = 50                 # fixed visual width
+_FILLED = "♪"                 # music note for filled portion
+_EMPTY  = "-"                 # dash for empty portion
+
 def render_progress_block(title: str, percent01: float, eta_s: int | None, abr_kbps: int | None) -> str:
+    """
+    Returns a Discord code-fenced block with a constant-length bar (always _BAR_LEN chars).
+    Fills with music notes in tandem with download progress.
+    """
     p = max(0.0, min(1.0, float(percent01)))
     pct = int(round(p * 100))
-    length = 22
-    filled = int(round(length * p))
-    bar = "#" * filled + "-" * (length - filled)
+    filled = int(round(_BAR_LEN * p))
+    bar = (_FILLED * filled) + (_EMPTY * (_BAR_LEN - filled))
+
     eta_part = f"  ETA {int(eta_s)}s" if eta_s and eta_s > 0 else ""
     abr_part = f"  @{abr_kbps} kbps" if abr_kbps else ""
+
     return (
         f"🎶 **{title}**\n"
         f"```"
@@ -56,7 +65,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}."
     )
 
-    # ---- public notice ----
+    # ---- public notice (we’ll later edit this with Source + Download) ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
     # ---- temp working folder ----
@@ -134,7 +143,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 
     # ---- detect server upload limit (bytes) ----
     if interaction.guild is not None and hasattr(interaction.guild, "filesize_limit"):
-        upload_limit = int(interaction.guild.filesize_limit)  # auto: 8 MB, 50/100 MB on boosted servers
+        upload_limit = int(interaction.guild.filesize_limit)  # true per-guild cap
     else:
         upload_limit = 8 * 1024 * 1024  # fallback
 
@@ -155,29 +164,38 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         clean_dir(session_dir)
         return
 
-    # ---- upload each part as an attachment ----
+    # ---- upload each part; remember the first attachment link for summary ----
+    first_part_url = None
     for i, zp in enumerate(parts, start=1):
         try:
-            await interaction.followup.send(
+            msg = await interaction.followup.send(
                 content=f"📦 Part {i}/{len(parts)}",
                 file=discord.File(zp),
                 ephemeral=False
             )
+            # store jump URL of first part for the main summary link
+            if first_part_url is None:
+                first_part_url = msg.jump_url
         except Exception:
-            # keep going even if one fails
             pass
         await asyncio.sleep(0.3)
 
-    # ---- finalize/public summary ----
+    # ---- finalize/public summary (with Source + Download jump link) ----
     elapsed = int(time.monotonic() - start_ts)
     mins, secs = divmod(elapsed, 60)
     elapsed_text = f"{mins:02d}:{secs:02d}"
+
+    source_md = f"[Source]({link})"
+    download_md = f"[Download]({first_part_url})" if first_part_url else "Download posted below"
 
     await ephemeral.edit(content="✅ Done! Cleaning up…")
     clean_dir(session_dir)
 
     await public_msg.edit(
-        content=f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — {elapsed_text} @{TARGET_ABR} kbps ✅"
+        content=(
+            f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
+            f"{elapsed_text} @{TARGET_ABR} kbps · {source_md} · {download_md} ✅"
+        )
     )
     await asyncio.sleep(1.2)
     try:
@@ -215,12 +233,10 @@ def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -
     for fp in files:
         size = os.path.getsize(fp)
 
-        # If a single file is bigger than the part limit, we can't include it anywhere.
-        # Bail out and let caller notify the user.
+        # If a single file is bigger than the part limit and it's the only file, bail out.
         if size > part_limit_bytes and len(files) == 1:
             return []
 
-        # If adding this file would bust the current part size, flush and start new.
         if total_in_bundle and (total_in_bundle + size) > part_limit_bytes:
             zp = flush_bundle(idx)
             if zp:
@@ -237,8 +253,6 @@ def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -
     if zp:
         parts.append(zp)
 
-    # In the extreme case where every single file individually exceeds part_limit_bytes,
-    # 'parts' will be empty and caller handles the message.
     return parts
 
 # ==============================================================
@@ -255,8 +269,7 @@ def extract_info(link, opts):
 
 async def on_progress(d, ephemeral_msg):
     """
-    Live progress renderer. ASCII bar inside a code block so it always
-    displays correctly in Discord.
+    Live progress renderer. Music-note bar inside a code block.
     """
     if d.get("status") != "downloading":
         return
@@ -264,7 +277,7 @@ async def on_progress(d, ephemeral_msg):
     filename = d.get("filename") or "unknown"
     title = os.path.splitext(os.path.basename(filename))[0]
 
-    # Get percent robustly
+    # robust percent
     pct01 = None
     if "_percent_str" in d:
         try:
