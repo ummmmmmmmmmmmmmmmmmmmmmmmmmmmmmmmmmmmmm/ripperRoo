@@ -1,7 +1,7 @@
 # rip_core.py
 import os, tempfile, time, json
 from typing import Dict, Any, List, Optional
-from constants import TARGET_ABR_KBPS, DEFAULT_ZIP_PART_MB
+from constants import TARGET_ABR_KBPS, DEFAULT_ZIP_PART_MB, YTDLP_FORMAT_FALLBACK
 from ytdlp_wrapper import extract_info, download_all
 from ffmpeg_utils import transcode_to_mp3, embed_art_in_mp3
 from packager import build_zip_parts
@@ -94,42 +94,42 @@ def rip_to_zips(
     zip_part_limit_bytes: int = DEFAULT_ZIP_PART_MB * 1024 * 1024,
 ) -> Dict[str, Any]:
     """
-    Core rip function:
-      - downloads (playlist-safe) with yt-dlp
-      - ffmpeg-transcodes everything to MP3 @ TARGET_ABR_KBPS
-      - optionally embeds shared art if present
-      - writes docs (TRACKLIST.txt, metadata.json, playlist.m3u8)
-      - zips into <= zip_part_limit_bytes parts
-    Returns: { 'zips': [paths], 'count': int, 'duration_hmmss': str, 'bitrate': int, 'zip_base': str, 'work_dir': str }
+    Downloads (playlist-safe), ffmpeg-transcodes to MP3, embeds art (optional),
+    writes docs, and zips into parts <= zip_part_limit_bytes.
     """
     t0 = time.monotonic()
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
 
-    # 1) Probe for playlist size/naming info (playlist-safe)
+    # Probe info for naming/tracklist
     info = extract_info(url, session_dir, include_art)
-    zip_base = _derive_zip_basename(info)
 
-    # 2) Download (playlist-safe). Progress hook optional (UI layer can pass one).
-    download_all(url, session_dir, include_art, progress_hook=None)
+    # First pass download (preferred formats)
+    download_all(url, session_dir, include_art)
 
-    # 3) Collect and transcode to MP3 via ffmpeg
+    # Collect any audio-like files
     raw_files = _collect_audio_files(session_dir)
+
+    # SECOND-CHANCE: If nothing grabbed (blocked formats), retry with broader format
+    if not raw_files:
+        download_all(url, session_dir, include_art, format_str=YTDLP_FORMAT_FALLBACK)
+        raw_files = _collect_audio_files(session_dir)
+
     if not raw_files:
         raise RuntimeError("No audio files were downloaded (all items unavailable?).")
 
+    # Transcode everything to MP3 via FFmpeg
     mp3_files: List[str] = []
     for src in raw_files:
         root, ext = os.path.splitext(src)
         dst = root + ".mp3"
         if ext.lower() == ".mp3":
-            mp3_files.append(src)  # keep as-is
+            mp3_files.append(src)
         else:
             transcode_to_mp3(src, dst)
             mp3_files.append(dst)
 
-    # 4) Shared art: try to embed into each MP3 if we have exactly one art file
+    # Embed shared art if present and requested
     if include_art:
-        # find one plausible art file (yt-dlp stores as .jpg/.webp/.png next to media)
         art = None
         for name in os.listdir(session_dir):
             if os.path.splitext(name)[1].lower() in {".jpg", ".jpeg", ".png", ".webp"}:
@@ -137,23 +137,20 @@ def rip_to_zips(
                 break
         if art:
             for mp3 in mp3_files:
-                try:
-                    embed_art_in_mp3(mp3, art)
-                except Exception:
-                    # non-fatal: keep going
-                    pass
+                try: embed_art_in_mp3(mp3, art)
+                except Exception: pass  # non-fatal
 
-    # 5) Write docs
+    # Docs + playlist
     docs = _write_docs(session_dir, info, mp3_files)
 
-    # 6) Zip into parts
+    # Zip parts
+    zip_base = _derive_zip_basename(info)
     zips = build_zip_parts(mp3_files, session_dir, zip_base, zip_part_limit_bytes, extra_first=docs)
     if not zips:
-        # if a single file is larger than part limit, raise a clear error
         biggest = max((os.path.getsize(f), f) for f in mp3_files)[1]
         raise RuntimeError(f"Track too large for part limit: {os.path.basename(biggest)}")
 
-    # duration estimate (sum of entry durations if present)
+    # Duration (best-effort sum of entry durations)
     entries = _normalize_entries(info)
     total_sec = 0
     for e in entries:
@@ -167,5 +164,5 @@ def rip_to_zips(
         "duration_hmmss": dur_hmmss,
         "bitrate": TARGET_ABR_KBPS,
         "zip_base": zip_base,
-        "work_dir": session_dir,  # caller may remove
+        "work_dir": session_dir,
     }
