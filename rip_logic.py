@@ -3,8 +3,8 @@ from ui_components import ArtChoice, ZipChoice
 from utils import validate_link, clean_dir
 from config import ALLOWED_DOMAINS
 
-TARGET_ABR = 192  # kbps for FFmpegExtractAudio
-BAR_LEN     = 50  # fixed progress bar width
+TARGET_ABR = 192   # kbps
+BAR_LEN     = 50   # visual width for the bar
 FILLED_CHAR = "♪"
 EMPTY_CHAR  = "-"
 
@@ -19,7 +19,7 @@ class _QuietLogger:
     def error(self, msg):
         print(msg)
 
-# -------------------- Discord-safe progress blocks --------------------
+# -------------------- Progress rendering --------------------
 def render_progress_block(title: str, p01: float, eta_s: int | None, abr_kbps: int | None) -> str:
     p = max(0.0, min(1.0, float(p01)))
     pct = int(round(p * 100))
@@ -35,7 +35,9 @@ def render_progress_block(title: str, p01: float, eta_s: int | None, abr_kbps: i
     )
 
 def render_ffmpeg_block(title: str) -> str:
-    bar = FILLED_CHAR * (BAR_LEN // 3) + EMPTY_CHAR * (BAR_LEN - BAR_LEN // 3)
+    # small moving chunk for "converting…" phase
+    chunk = FILLED_CHAR * (BAR_LEN // 3)
+    bar = chunk + (EMPTY_CHAR * (BAR_LEN - len(chunk)))
     return (
         f"🎶 **{title}**\n"
         f"```"
@@ -67,30 +69,106 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}."
     )
 
-    # ---- public notice (we’ll later edit this with Source + Download) ----
+    # ---- public notice (we will replace this later with the download attached) ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
     # ---- temp working folder ----
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
 
-    # ---- capture main loop for cross-thread updates + throttle ----
+    # ---- progress state + background animator ----
     loop = asyncio.get_running_loop()
-    last_update = {"t": 0.0}
+    state = {
+        "title": "…",
+        "downloaded": 0,
+        "total": None,
+        "eta": None,
+        "abr": TARGET_ABR,
+        "speed": None,        # bytes/sec
+        "p01": 0.0,           # 0..1 (authoritative from hooks)
+        "status": "idle",     # downloading | postprocessing | finished
+        "active": True,
+        "last_ts": time.monotonic(),
+    }
 
+    async def animator():
+        # Smooth, high-frequency UI updates based on last speed (extrapolation)
+        tick = 0.13  # ~7-8 fps looks great and avoids rate limits
+        while state["active"]:
+            try:
+                p = state["p01"]
+                # extrapolate between hooks when we know total, speed
+                if state["status"] == "downloading" and state["total"] and state["speed"]:
+                    now = time.monotonic()
+                    dt = now - state["last_ts"]
+                    state["last_ts"] = now
+                    est_bytes = state["downloaded"] + state["speed"] * dt
+                    p = min(1.0, max(0.0, float(est_bytes) / float(state["total"])))
+                if state["status"] == "postprocessing":
+                    await ephemeral.edit(content=render_ffmpeg_block(state["title"]))
+                else:
+                    await ephemeral.edit(content=render_progress_block(state["title"], p, state["eta"], state["abr"]))
+            except Exception:
+                pass
+            await asyncio.sleep(tick)
+
+    anim_task = asyncio.create_task(animator())
+
+    # ---- progress hook from yt-dlp (authoritative updates) ----
     def progress_hook(d):
-        # yt-dlp runs in a worker thread; schedule coroutine on main loop
-        now = time.time()
-        if now - last_update["t"] < 0.2:  # 5 updates/sec
-            return
-        last_update["t"] = now
-        asyncio.run_coroutine_threadsafe(on_progress(d, ephemeral), loop)
+        # called from worker thread; schedule updates onto main loop
+        def upd():
+            status = d.get("status")
+            filename = d.get("filename") or "unknown"
+            state["title"] = os.path.splitext(os.path.basename(filename))[0]
+            state["abr"] = d.get("abr", TARGET_ABR)
+
+            if status == "downloading":
+                state["status"] = "downloading"
+                # Prefer bytes progress; fallback to fragments; final fallback to percent_str
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                dl    = d.get("downloaded_bytes")
+                speed = d.get("speed")
+                frag_count = d.get("fragment_count") or d.get("n_fragments")
+                frag_idx   = d.get("fragment_index")
+                p01 = None
+
+                if total and dl is not None:
+                    state["total"] = total
+                    state["downloaded"] = dl
+                    p01 = max(0.0, min(1.0, dl / total))
+                elif frag_count:
+                    p01 = max(0.0, min(1.0, ((frag_idx or 0) + 1) / float(frag_count)))
+                elif "_percent_str" in d:
+                    try:
+                        p01 = float(d["_percent_str"].replace("%", "")) / 100.0
+                    except Exception:
+                        p01 = None
+
+                if speed:
+                    state["speed"] = speed  # bytes/sec
+                state["eta"] = d.get("eta")
+
+                if p01 is not None:
+                    state["p01"] = p01
+                state["last_ts"] = time.monotonic()
+
+            elif status == "postprocessing":
+                state["status"] = "postprocessing"
+                state["eta"] = None
+
+            elif status == "finished":
+                state["status"] = "finished"
+                state["p01"] = 1.0
+                state["eta"] = 0
+
+        asyncio.run_coroutine_threadsafe(asyncio.to_thread(upd), loop)
 
     # ---- yt-dlp options ----
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
         "logger": _QuietLogger(),
-        "noprogress": True,      # silence terminal progress
+        "noprogress": True,
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
@@ -119,7 +197,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     total = len(entries)
     await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
 
-    # ---- album art optimization: download once for sets ----
+    # ---- album art optimization (once for sets) ----
     if include_art and total and total > 1:
         ydl_opts["writethumbnail"] = False
         thumb = (info.get("entries") or [{}])[0].get("thumbnail")
@@ -132,9 +210,16 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 pass
             await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
 
-    # ---- run rip (real downloads) ----
+    # ---- run rip ----
     await asyncio.to_thread(run_ytdlp, link, ydl_opts)
-    await asyncio.sleep(0.5)  # allow handles to close
+    await asyncio.sleep(0.4)  # let handles close
+
+    # stop animator
+    state["active"] = False
+    try:
+        await anim_task
+    except Exception:
+        pass
 
     # ---- collect output files ----
     files = [os.path.join(session_dir, f) for f in os.listdir(session_dir) if f.lower().endswith(".mp3")]
@@ -146,68 +231,72 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         return
 
     # ---- detect server upload limit (bytes) ----
-    if interaction.guild is not None and hasattr(interaction.guild, "filesize_limit"):
-        upload_limit = int(interaction.guild.filesize_limit)  # true per-guild cap
-    else:
-        upload_limit = 8 * 1024 * 1024  # fallback
+    upload_limit = int(getattr(interaction.guild, "filesize_limit", 8 * 1024 * 1024))
+    target_part_size = max(1, upload_limit - 256 * 1024)  # headroom
 
-    # keep some headroom for zip headers/etc.
-    target_part_size = max(1, upload_limit - 256 * 1024)
-
-    # ---- always deliver as ZIP parts (never individual tracks) ----
+    # ---- zip into parts under limit ----
     await ephemeral.edit(content="📦 Packaging tracks for Discord…")
     parts = build_zip_parts(files, session_dir, target_part_size)
-
     if not parts:
-        # Handle rare case: a single MP3 > server limit (cannot be sent)
+        # A single track exceeds limit
         too_big = max((os.path.getsize(f), f) for f in files)[1]
         mb = round(os.path.getsize(too_big) / (1024 * 1024), 2)
-        await ephemeral.edit(
-            content=f"⚠️ A single track is {mb} MB which exceeds this server’s upload limit. Unable to send."
-        )
+        await ephemeral.edit(content=f"⚠️ A track is {mb} MB and exceeds this server’s upload limit. Unable to send.")
         clean_dir(session_dir)
         return
 
-    # ---- upload each part; remember the first attachment link for summary ----
-    first_part_url = None
-    for i, zp in enumerate(parts, start=1):
-        try:
-            msg = await interaction.followup.send(
-                content=f"📦 Part {i}/{len(parts)}",
-                file=discord.File(zp),
-                ephemeral=False
-            )
-            if first_part_url is None:
-                first_part_url = msg.jump_url
-        except Exception:
-            pass
-        await asyncio.sleep(0.3)
+    # ---- delete the original public notice and post summary WITH first part attached ----
+    try:
+        await public_msg.delete()
+    except Exception:
+        pass
 
-    # ---- finalize/public summary (with Source + Download jump link) ----
     elapsed = int(time.monotonic() - start_ts)
     mins, secs = divmod(elapsed, 60)
     elapsed_text = f"{mins:02d}:{secs:02d}"
-
     source_md = f"[Source]({link})"
-    download_md = f"[Download]({first_part_url})" if first_part_url else "Download posted below"
+
+    first = parts[0]
+    summary_msg = None
+    try:
+        summary_msg = await interaction.channel.send(
+            content=(
+                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
+                f"{elapsed_text} @{TARGET_ABR} kbps · {source_md} · Download (Part 1/{len(parts)}) ✅"
+            ),
+            file=discord.File(first),
+        )
+    except Exception:
+        # If first upload fails, fall back to text-only summary
+        summary_msg = await interaction.channel.send(
+            content=(
+                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
+                f"{elapsed_text} @{TARGET_ABR} kbps · {source_md} ✅"
+            )
+        )
+
+    # ---- reply with remaining parts under the summary ----
+    for i, zp in enumerate(parts[1:], start=2):
+        try:
+            await interaction.channel.send(
+                content=f"📦 Part {i}/{len(parts)}",
+                file=discord.File(zp),
+                reference=summary_msg
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
 
     await ephemeral.edit(content="✅ Done! Cleaning up…")
     clean_dir(session_dir)
-
-    await public_msg.edit(
-        content=(
-            f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
-            f"{elapsed_text} @{TARGET_ABR} kbps · {source_md} · {download_md} ✅"
-        )
-    )
-    await asyncio.sleep(1.2)
     try:
+        await asyncio.sleep(1.0)
         await ephemeral.delete()
     except Exception:
         pass
 
 # ==============================================================
-# ZIP PARTITIONING (stay under guild upload limit)
+# ZIP PARTITIONING
 # ==============================================================
 
 def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -> list[str]:
@@ -217,7 +306,6 @@ def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -
     """
     if not files:
         return []
-
     parts: list[str] = []
     bundle: list[str] = []
     total_in_bundle = 0
@@ -235,27 +323,17 @@ def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -
     idx = 1
     for fp in files:
         size = os.path.getsize(fp)
-
-        # If a single file is bigger than the part limit and it's the only file, bail out.
         if size > part_limit_bytes and len(files) == 1:
             return []
-
         if total_in_bundle and (total_in_bundle + size) > part_limit_bytes:
             zp = flush_bundle(idx)
             if zp:
-                parts.append(zp)
-                idx += 1
-            bundle = []
-            total_in_bundle = 0
-
-        bundle.append(fp)
-        total_in_bundle += size
-
-    # flush last bundle
+                parts.append(zp); idx += 1
+            bundle = []; total_in_bundle = 0
+        bundle.append(fp); total_in_bundle += size
     zp = flush_bundle(idx)
     if zp:
         parts.append(zp)
-
     return parts
 
 # ==============================================================
@@ -272,69 +350,14 @@ def extract_info(link, opts):
 
 async def on_progress(d, ephemeral_msg):
     """
-    Rock-solid progress:
-      - Prefer bytes-based progress (downloaded/total)
-      - Else use fragment_index/fragment_count
-      - Else 'finished' => 100%
-      - 'postprocessing' => show converting block
+    Authoritative updates from yt-dlp.
+    We prefer bytes; else fragment ratio; else last-resort percent_str.
+    We also mark postprocessing and finished so the animator knows what to show.
     """
-    status = d.get("status")
-    filename = d.get("filename") or "unknown"
-    title = os.path.splitext(os.path.basename(filename))[0]
-
-    if status == "postprocessing":
-        try:
-            await ephemeral_msg.edit(content=render_ffmpeg_block(title))
-        except Exception:
-            pass
-        return
-
-    if status == "finished":
-        try:
-            await ephemeral_msg.edit(content=render_progress_block(title, 1.0, 0, d.get("abr", TARGET_ABR)))
-        except Exception:
-            pass
-        return
-
-    if status != "downloading":
-        return
-
-    # ----- compute progress robustly -----
-    # 1) bytes if available
-    total = d.get("total_bytes") or d.get("total_bytes_estimate")
-    downloaded = d.get("downloaded_bytes")
-    p01 = None
-    if total and downloaded:
-        try:
-            p01 = max(0.0, min(1.0, downloaded / total))
-        except Exception:
-            p01 = None
-
-    # 2) fragment ratio fallback
-    if p01 is None:
-        frag_count = d.get("fragment_count") or d.get("n_fragments")
-        frag_index = d.get("fragment_index")
-        if frag_count:
-            # frag_index is 0-based; add 1 for user-facing progress across fragments
-            try:
-                p01 = max(0.0, min(1.0, ((frag_index or 0) + 1) / float(frag_count)))
-            except Exception:
-                p01 = None
-
-    # 3) percent string last (often flaky)
-    if p01 is None and "_percent_str" in d:
-        try:
-            p01 = float(d["_percent_str"].replace("%", "")) / 100.0
-        except Exception:
-            p01 = 0.0
-
-    eta = d.get("eta")
-    abr = d.get("abr", TARGET_ABR)
-
-    try:
-        await ephemeral_msg.edit(content=render_progress_block(title, p01 or 0.0, eta, abr))
-    except Exception:
-        pass
+    # d is received in worker thread; just store into state via closure in handle_rip()
+    # The actual state updates are done inside progress_hook via the 'upd()' inner function.
+    # (This stub is kept for clarity; actual updates are scheduled from progress_hook.)
+    return
 
 # simple HTTP fetcher (for shared album art)
 def download_file(url: str, path: str):
