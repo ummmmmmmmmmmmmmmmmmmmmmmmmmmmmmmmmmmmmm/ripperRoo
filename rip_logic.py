@@ -1,3 +1,4 @@
+# rip_logic.py
 import discord, asyncio, os, tempfile, yt_dlp, time, zipfile, re, json
 from ui_components import ArtChoice, ZipChoice
 from utils import validate_link, clean_dir
@@ -101,6 +102,10 @@ def normalize_entries(info: dict) -> list[dict]:
     return [info]
 
 def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> list[str]:
+    """
+    Create TRACKLIST.txt, metadata.json, and playlist.m3u8 in session_dir.
+    Returns their paths (included in ZIP Part 1).
+    """
     entries = normalize_entries(info)
 
     tracks = []
@@ -127,6 +132,7 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
             "filename": filename,
         })
 
+    # TRACKLIST.txt
     tl_lines = []
     for t in tracks:
         idx = f"{int(t['index']):02d}" if isinstance(t["index"], int) else "--"
@@ -143,6 +149,7 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
     with open(tl_path, "w", encoding="utf-8") as f:
         f.write("\n".join(tl_lines) + "\n")
 
+    # metadata.json
     meta = {
         "zip_basename": derive_zip_basename(info),
         "count": len(tracks),
@@ -152,6 +159,7 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    # playlist.m3u8
     m3u_lines = ["#EXTM3U"]
     for t in tracks:
         artist = t["artist"] or "Unknown Artist"
@@ -170,9 +178,16 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
 # MAIN RIP COMMAND
 # ==============================================================
 
-
 async def handle_rip(interaction: discord.Interaction, link: str):
-    # ... your existing setup code above ...
+    start_ts = time.monotonic()
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    ephemeral = await interaction.followup.send("✅ Received. Checking link...", ephemeral=True)
+
+    # ---- validate domain ----
+    if not validate_link(link, ALLOWED_DOMAINS):
+        await ephemeral.edit(content="❌ Unsupported or invalid link.")
+        return
 
     # ---- ask for album art ----
     art_view = ArtChoice()
@@ -180,29 +195,26 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await art_view.wait()
     include_art = art_view.choice or False
 
-    # ✅ Replace the confirmation with your thank-you line,
-    #    then immediately transition to the Initializing… animation
+    # ✅ Replace with thank-you line, then immediately “Initializing…”
     await ephemeral.edit(
         content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘",
         view=None
     )
-    await asyncio.sleep(0.8)  # short acknowledgment so users can read it
+    await asyncio.sleep(0.8)
 
-    # ---- animated 'Initializing…' on the SAME ephemeral message ----
     init_active = True
     async def init_anim():
         i = 0
         while init_active:
             try:
-                dots = "." * (1 + (i % 3))
-                await ephemeral.edit(content=f"🛠️ Initializing{dots}")
+                await ephemeral.edit(content=render_initializing_frame(i))
             except Exception:
                 pass
             i += 1
             await asyncio.sleep(0.35)
     init_task = asyncio.create_task(init_anim())
 
-    # ---- public notice (to be replaced with the final kangaroo summary) ----
+    # ---- public notice (to be replaced with final kangaroo summary) ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
     # ---- temp working folder ----
@@ -216,15 +228,15 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "total": None,
         "eta": None,
         "abr": TARGET_ABR,
-        "speed": None,
-        "p01": 0.0,
-        "status": "idle",
+        "speed": None,        # bytes/sec
+        "p01": 0.0,           # 0..1
+        "status": "idle",     # downloading | postprocessing | finished
         "active": True,
         "last_ts": time.monotonic(),
     }
 
     async def animator():
-        tick = 0.13
+        tick = 0.13  # ~7–8 fps
         while state["active"]:
             try:
                 p = state["p01"]
@@ -300,12 +312,14 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "noplaylist": False,
         "writethumbnail": include_art,
         "skip_download": False,
+        # speed/robustness
         "concurrent_fragment_downloads": 5,
         "retries": 5,
         "fragment_retries": 5,
         "buffersize": 128 * 1024,
         "continuedl": True,
         "socket_timeout": 10,
+        # progress + postprocessors
         "progress_hooks": [progress_hook],
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(TARGET_ABR)},
@@ -438,6 +452,11 @@ def build_zip_parts(
     base_name: str,
     extra_first: list[str] | None = None
 ) -> list[str]:
+    """
+    Create multiple ZIP files, each <= part_limit_bytes.
+    ZIP_STORED (no compression). Docs (extra_first) are added to Part 1.
+    Names like: 'Artist - Album_part_01.zip'
+    """
     extra_first = extra_first or []
     parts: list[str] = []
     bundle: list[str] = []
@@ -463,6 +482,7 @@ def build_zip_parts(
             bundle = []; total_in_bundle = 0
         bundle.append(doc); total_in_bundle += size
 
+    # Add audio files
     for fp in files:
         size = os.path.getsize(fp)
         if size > part_limit_bytes and len(files) == 1:

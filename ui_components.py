@@ -12,7 +12,8 @@ class ArtChoice(discord.ui.View):
         self.choice = True
         for child in self.children:
             child.disabled = True
-        await interaction.response.defer()  # don't change the message text/content
+        # Do not change message content here; rip_logic will take over.
+        await interaction.response.defer()
         self.stop()
 
     @discord.ui.button(label="No art", style=discord.ButtonStyle.secondary, emoji="🚫")
@@ -25,7 +26,7 @@ class ArtChoice(discord.ui.View):
 
 
 class ZipChoice(discord.ui.View):
-    """Optional zip prompt used earlier in the project; unchanged behavior."""
+    """Optional zip prompt (kept for compatibility)."""
     def __init__(self, timeout: float | None = 60):
         super().__init__(timeout=timeout)
         self.choice: bool | None = None
