@@ -4,6 +4,9 @@ from utils import validate_link, clean_dir
 from config import ALLOWED_DOMAINS
 
 TARGET_ABR = 192  # kbps for FFmpegExtractAudio
+BAR_LEN     = 50  # fixed progress bar width
+FILLED_CHAR = "♪"
+EMPTY_CHAR  = "-"
 
 # -------------------- Quiet logger for yt-dlp (no terminal progress) --------------------
 class _QuietLogger:
@@ -17,27 +20,26 @@ class _QuietLogger:
         print(msg)
 
 # -------------------- Discord-safe progress blocks --------------------
-_BAR_LEN = 50                 # fixed visual width
-_FILLED = "♪"                 # music note for filled portion
-_EMPTY  = "-"                 # dash for empty portion
-
-def render_progress_block(title: str, percent01: float, eta_s: int | None, abr_kbps: int | None) -> str:
-    """
-    Returns a Discord code-fenced block with a constant-length bar (always _BAR_LEN chars).
-    Fills with music notes in tandem with download progress.
-    """
-    p = max(0.0, min(1.0, float(percent01)))
+def render_progress_block(title: str, p01: float, eta_s: int | None, abr_kbps: int | None) -> str:
+    p = max(0.0, min(1.0, float(p01)))
     pct = int(round(p * 100))
-    filled = int(round(_BAR_LEN * p))
-    bar = (_FILLED * filled) + (_EMPTY * (_BAR_LEN - filled))
-
+    filled = int(round(BAR_LEN * p))
+    bar = (FILLED_CHAR * filled) + (EMPTY_CHAR * (BAR_LEN - filled))
     eta_part = f"  ETA {int(eta_s)}s" if eta_s and eta_s > 0 else ""
     abr_part = f"  @{abr_kbps} kbps" if abr_kbps else ""
-
     return (
         f"🎶 **{title}**\n"
         f"```"
         f"[{bar}]  {pct}%{eta_part}{abr_part}"
+        f"```"
+    )
+
+def render_ffmpeg_block(title: str) -> str:
+    bar = FILLED_CHAR * (BAR_LEN // 3) + EMPTY_CHAR * (BAR_LEN - BAR_LEN // 3)
+    return (
+        f"🎶 **{title}**\n"
+        f"```"
+        f"[{bar}]  converting…  @{TARGET_ABR} kbps"
         f"```"
     )
 
@@ -74,9 +76,11 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     # ---- capture main loop for cross-thread updates + throttle ----
     loop = asyncio.get_running_loop()
     last_update = {"t": 0.0}
+
     def progress_hook(d):
+        # yt-dlp runs in a worker thread; schedule coroutine on main loop
         now = time.time()
-        if now - last_update["t"] < 0.5:  # 2 updates/sec
+        if now - last_update["t"] < 0.2:  # 5 updates/sec
             return
         last_update["t"] = now
         asyncio.run_coroutine_threadsafe(on_progress(d, ephemeral), loop)
@@ -86,7 +90,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "format": "bestaudio/best",
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
         "logger": _QuietLogger(),
-        "noprogress": True,
+        "noprogress": True,      # silence terminal progress
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
@@ -173,7 +177,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 file=discord.File(zp),
                 ephemeral=False
             )
-            # store jump URL of first part for the main summary link
             if first_part_url is None:
                 first_part_url = msg.jump_url
         except Exception:
@@ -269,31 +272,67 @@ def extract_info(link, opts):
 
 async def on_progress(d, ephemeral_msg):
     """
-    Live progress renderer. Music-note bar inside a code block.
+    Rock-solid progress:
+      - Prefer bytes-based progress (downloaded/total)
+      - Else use fragment_index/fragment_count
+      - Else 'finished' => 100%
+      - 'postprocessing' => show converting block
     """
-    if d.get("status") != "downloading":
-        return
-
+    status = d.get("status")
     filename = d.get("filename") or "unknown"
     title = os.path.splitext(os.path.basename(filename))[0]
 
-    # robust percent
-    pct01 = None
-    if "_percent_str" in d:
+    if status == "postprocessing":
         try:
-            pct01 = float(d["_percent_str"].replace("%", "")) / 100.0
+            await ephemeral_msg.edit(content=render_ffmpeg_block(title))
         except Exception:
-            pct01 = None
-    if pct01 is None:
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        downloaded = d.get("downloaded_bytes") or 0
-        pct01 = (downloaded / total) if total else 0.0
+            pass
+        return
+
+    if status == "finished":
+        try:
+            await ephemeral_msg.edit(content=render_progress_block(title, 1.0, 0, d.get("abr", TARGET_ABR)))
+        except Exception:
+            pass
+        return
+
+    if status != "downloading":
+        return
+
+    # ----- compute progress robustly -----
+    # 1) bytes if available
+    total = d.get("total_bytes") or d.get("total_bytes_estimate")
+    downloaded = d.get("downloaded_bytes")
+    p01 = None
+    if total and downloaded:
+        try:
+            p01 = max(0.0, min(1.0, downloaded / total))
+        except Exception:
+            p01 = None
+
+    # 2) fragment ratio fallback
+    if p01 is None:
+        frag_count = d.get("fragment_count") or d.get("n_fragments")
+        frag_index = d.get("fragment_index")
+        if frag_count:
+            # frag_index is 0-based; add 1 for user-facing progress across fragments
+            try:
+                p01 = max(0.0, min(1.0, ((frag_index or 0) + 1) / float(frag_count)))
+            except Exception:
+                p01 = None
+
+    # 3) percent string last (often flaky)
+    if p01 is None and "_percent_str" in d:
+        try:
+            p01 = float(d["_percent_str"].replace("%", "")) / 100.0
+        except Exception:
+            p01 = 0.0
 
     eta = d.get("eta")
     abr = d.get("abr", TARGET_ABR)
 
     try:
-        await ephemeral_msg.edit(content=render_progress_block(title, pct01, eta, abr))
+        await ephemeral_msg.edit(content=render_progress_block(title, p01 or 0.0, eta, abr))
     except Exception:
         pass
 
