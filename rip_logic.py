@@ -1,4 +1,4 @@
-import discord, asyncio, os, tempfile, yt_dlp, time, zipfile
+import discord, asyncio, os, tempfile, yt_dlp, time, zipfile, re
 from ui_components import ArtChoice, ZipChoice
 from utils import validate_link, clean_dir
 from config import ALLOWED_DOMAINS
@@ -19,7 +19,46 @@ class _QuietLogger:
     def error(self, msg):
         print(msg)
 
-# -------------------- Progress rendering --------------------
+# -------------------- helpers: safe names & rendering --------------------
+SAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9 \-_.]+")
+
+def safe_name(s: str, maxlen: int = 80) -> str:
+    s = SAFE_CHARS_RE.sub("_", s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return (s[:maxlen]).strip() or "rip"
+
+def derive_zip_basename(info: dict) -> str:
+    """
+    Prefer: Artist - Album
+    Else:   Artist - Title
+    Else:   Title
+    Fallback: rip
+    Works for single and playlist results.
+    """
+    # Single or first entry fields
+    entry = info
+    if info and isinstance(info.get("entries"), list) and info["entries"]:
+        entry = info["entries"][0] or {}
+
+    artist = (
+        entry.get("artist")
+        or entry.get("uploader")
+        or entry.get("channel")
+        or info.get("uploader")
+        or info.get("channel")
+        or ""
+    )
+    album = entry.get("album") or info.get("playlist_title") or info.get("playlist") or ""
+    title = entry.get("track") or entry.get("title") or info.get("title") or ""
+
+    if artist and album:
+        return safe_name(f"{artist} - {album}")
+    if artist and title:
+        return safe_name(f"{artist} - {title}")
+    if title:
+        return safe_name(title)
+    return "rip"
+
 def render_progress_block(title: str, p01: float, eta_s: int | None, abr_kbps: int | None) -> str:
     p = max(0.0, min(1.0, float(p01)))
     pct = int(round(p * 100))
@@ -35,7 +74,6 @@ def render_progress_block(title: str, p01: float, eta_s: int | None, abr_kbps: i
     )
 
 def render_ffmpeg_block(title: str) -> str:
-    # small moving chunk for "converting…" phase
     chunk = FILLED_CHAR * (BAR_LEN // 3)
     bar = chunk + (EMPTY_CHAR * (BAR_LEN - len(chunk)))
     return (
@@ -44,6 +82,10 @@ def render_ffmpeg_block(title: str) -> str:
         f"[{bar}]  converting…  @{TARGET_ABR} kbps"
         f"```"
     )
+
+def render_initializing_frame(dot_count: int) -> str:
+    dots = "." * (1 + (dot_count % 3))
+    return f"🛠️ Initializing{dots}"
 
 # ==============================================================
 # MAIN RIP COMMAND
@@ -65,11 +107,22 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await ephemeral.edit(content="🎨 Include album art?", view=art_view)
     await art_view.wait()
     include_art = art_view.choice or False
-    await ephemeral.edit(
-        content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}."
-    )
+    await ephemeral.edit(content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}.")
 
-    # ---- public notice (we will replace this later with the download attached) ----
+    # ---- show animated "Initializing..." while we prep ----
+    init_active = True
+    async def init_anim():
+        i = 0
+        while init_active:
+            try:
+                await ephemeral.edit(content=render_initializing_frame(i))
+            except Exception:
+                pass
+            i += 1
+            await asyncio.sleep(0.35)  # nice tempo for dots
+    init_task = asyncio.create_task(init_anim())
+
+    # ---- public notice (to be replaced later with download attached) ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
     # ---- temp working folder ----
@@ -84,19 +137,17 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "eta": None,
         "abr": TARGET_ABR,
         "speed": None,        # bytes/sec
-        "p01": 0.0,           # 0..1 (authoritative from hooks)
+        "p01": 0.0,           # 0..1
         "status": "idle",     # downloading | postprocessing | finished
         "active": True,
         "last_ts": time.monotonic(),
     }
 
     async def animator():
-        # Smooth, high-frequency UI updates based on last speed (extrapolation)
-        tick = 0.13  # ~7-8 fps looks great and avoids rate limits
+        tick = 0.13  # ~7–8 fps
         while state["active"]:
             try:
                 p = state["p01"]
-                # extrapolate between hooks when we know total, speed
                 if state["status"] == "downloading" and state["total"] and state["speed"]:
                     now = time.monotonic()
                     dt = now - state["last_ts"]
@@ -111,11 +162,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 pass
             await asyncio.sleep(tick)
 
-    anim_task = asyncio.create_task(animator())
-
-    # ---- progress hook from yt-dlp (authoritative updates) ----
+    # ---- progress hook (authoritative) ----
     def progress_hook(d):
-        # called from worker thread; schedule updates onto main loop
         def upd():
             status = d.get("status")
             filename = d.get("filename") or "unknown"
@@ -124,7 +172,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 
             if status == "downloading":
                 state["status"] = "downloading"
-                # Prefer bytes progress; fallback to fragments; final fallback to percent_str
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
                 dl    = d.get("downloaded_bytes")
                 speed = d.get("speed")
@@ -145,9 +192,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                         p01 = None
 
                 if speed:
-                    state["speed"] = speed  # bytes/sec
+                    state["speed"] = speed
                 state["eta"] = d.get("eta")
-
                 if p01 is not None:
                     state["p01"] = p01
                 state["last_ts"] = time.monotonic()
@@ -161,6 +207,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 state["p01"] = 1.0
                 state["eta"] = 0
 
+        # schedule onto main loop
         asyncio.run_coroutine_threadsafe(asyncio.to_thread(upd), loop)
 
     # ---- yt-dlp options ----
@@ -191,11 +238,21 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     }
 
     # ---- fetch info (playlist size & shared art) ----
-    await ephemeral.edit(content="🎵 Fetching playlist info...")
     info = await asyncio.to_thread(extract_info, link, ydl_opts)
+
+    # stop "Initializing..."
+    init_active = False
+    try:
+        await init_task
+    except Exception:
+        pass
+
     entries = info.get("entries", [info]) if info else []
     total = len(entries)
     await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
+
+    # base name for zip parts
+    zip_base = derive_zip_basename(info)
 
     # ---- album art optimization (once for sets) ----
     if include_art and total and total > 1:
@@ -210,11 +267,11 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 pass
             await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
 
-    # ---- run rip ----
+    # ---- run rip + start animator ----
+    anim_task = asyncio.create_task(animator())
     await asyncio.to_thread(run_ytdlp, link, ydl_opts)
     await asyncio.sleep(0.4)  # let handles close
 
-    # stop animator
     state["active"] = False
     try:
         await anim_task
@@ -234,11 +291,10 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     upload_limit = int(getattr(interaction.guild, "filesize_limit", 8 * 1024 * 1024))
     target_part_size = max(1, upload_limit - 256 * 1024)  # headroom
 
-    # ---- zip into parts under limit ----
+    # ---- zip into parts under limit, using the derived base name ----
     await ephemeral.edit(content="📦 Packaging tracks for Discord…")
-    parts = build_zip_parts(files, session_dir, target_part_size)
+    parts = build_zip_parts(files, session_dir, target_part_size, zip_base)
     if not parts:
-        # A single track exceeds limit
         too_big = max((os.path.getsize(f), f) for f in files)[1]
         mb = round(os.path.getsize(too_big) / (1024 * 1024), 2)
         await ephemeral.edit(content=f"⚠️ A track is {mb} MB and exceeds this server’s upload limit. Unable to send.")
@@ -267,7 +323,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             file=discord.File(first),
         )
     except Exception:
-        # If first upload fails, fall back to text-only summary
         summary_msg = await interaction.channel.send(
             content=(
                 f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
@@ -299,10 +354,11 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 # ZIP PARTITIONING
 # ==============================================================
 
-def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -> list[str]:
+def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int, base_name: str) -> list[str]:
     """
     Create multiple ZIP files, each <= part_limit_bytes.
     Uses ZIP_STORED (no compression) so size ~ sum(mp3 sizes) + tiny header.
+    Names like: 'Artist - Album_part_01.zip'
     """
     if not files:
         return []
@@ -313,7 +369,7 @@ def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -
     def flush_bundle(index: int):
         if not bundle:
             return None
-        zip_name = os.path.join(session_dir, f"rip_part_{index:02d}.zip")
+        zip_name = os.path.join(session_dir, f"{base_name}_part_{index:02d}.zip")
         with zipfile.ZipFile(zip_name, "w", compression=zipfile.ZIP_STORED) as zf:
             for fp in bundle:
                 arcname = os.path.basename(fp)
@@ -337,7 +393,7 @@ def build_zip_parts(files: list[str], session_dir: str, part_limit_bytes: int) -
     return parts
 
 # ==============================================================
-# yt-dlp helpers + progress
+# yt-dlp helpers
 # ==============================================================
 
 def run_ytdlp(link, opts):
@@ -347,17 +403,6 @@ def run_ytdlp(link, opts):
 def extract_info(link, opts):
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(link, download=False)
-
-async def on_progress(d, ephemeral_msg):
-    """
-    Authoritative updates from yt-dlp.
-    We prefer bytes; else fragment ratio; else last-resort percent_str.
-    We also mark postprocessing and finished so the animator knows what to show.
-    """
-    # d is received in worker thread; just store into state via closure in handle_rip()
-    # The actual state updates are done inside progress_hook via the 'upd()' inner function.
-    # (This stub is kept for clarity; actual updates are scheduled from progress_hook.)
-    return
 
 # simple HTTP fetcher (for shared album art)
 def download_file(url: str, path: str):
