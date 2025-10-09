@@ -27,17 +27,19 @@ def safe_name(s: str, maxlen: int = 80) -> str:
     s = re.sub(r"\s+", " ", s)
     return (s[:maxlen]).strip() or "rip"
 
-def derive_zip_basename(info: dict) -> str:
+def derive_zip_basename(info: dict | None) -> str:
     """
     Prefer: Artist - Album
     Else:   Artist - Title
     Else:   Title
     Fallback: rip
     """
+    if not info:
+        return "rip"
     entry = info
-    if info and isinstance(info.get("entries"), list) and info["entries"]:
-        entry = info["entries"][0] or {}
-
+    if isinstance(info.get("entries"), list) and info["entries"]:
+        # pick first non-empty entry
+        entry = next((e for e in info["entries"] if e), {}) or {}
     artist = (
         entry.get("artist")
         or entry.get("uploader")
@@ -48,7 +50,6 @@ def derive_zip_basename(info: dict) -> str:
     )
     album = entry.get("album") or info.get("playlist_title") or info.get("playlist") or ""
     title = entry.get("track") or entry.get("title") or info.get("title") or ""
-
     if artist and album:
         return safe_name(f"{artist} - {album}")
     if artist and title:
@@ -93,34 +94,67 @@ def _seconds_to_hmmss(sec: int | float | None) -> str:
     m, s = divmod(sec, 60)
     return f"{m:02d}:{s:02d}"
 
-def normalize_entries(info: dict) -> list[dict]:
+def normalize_entries(info: dict | None) -> list[dict]:
+    """Return a list of extractor entries (single becomes [info])."""
     if not info:
         return []
-    if isinstance(info.get("entries"), list) and info["entries"]:
-        return [e or {} for e in info["entries"]]
+    entries = info.get("entries")
+    if isinstance(entries, list) and entries:
+        return [e or {} for e in entries if e is not None]
     return [info]
 
-def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> list[str]:
+def first_thumbnail_url(obj: dict | None) -> str | None:
+    """
+    Try several common shapes:
+      - obj['thumbnail']
+      - obj['thumbnails'][0]['url'] or ['id']
+    """
+    if not obj or not isinstance(obj, dict):
+        return None
+    # direct
+    thumb = obj.get("thumbnail")
+    if isinstance(thumb, str) and thumb:
+        return thumb
+    # list
+    thumbs = obj.get("thumbnails")
+    if isinstance(thumbs, list) and thumbs:
+        first = thumbs[0] or {}
+        return first.get("url") or first.get("id")
+    return None
+
+def find_shared_art_url(info: dict | None) -> str | None:
+    """Find a plausible image URL from playlist or first non-empty entry."""
+    if not info:
+        return None
+    # try playlist-level
+    t = first_thumbnail_url(info)
+    if t:
+        return t
+    # try first non-empty entry
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for e in entries:
+            t = first_thumbnail_url(e)
+            if t:
+                return t
+    return None
+
+def build_track_docs(session_dir: str, info: dict | None, ripped_files: list[str]) -> list[str]:
     """
     Create TRACKLIST.txt, metadata.json, and playlist.m3u8 in session_dir.
     Returns their paths (included in ZIP Part 1).
     """
     entries = normalize_entries(info)
-
     tracks = []
     for i, e in enumerate(entries, start=1):
         title  = e.get("track") or e.get("title") or ""
         artist = e.get("artist") or e.get("uploader") or e.get("channel") or ""
-        album  = e.get("album") or info.get("playlist_title") or info.get("playlist") or ""
+        album  = e.get("album") or (info.get("playlist_title") if info else "") or (info.get("playlist") if info else "") or ""
         idx    = e.get("playlist_index") or e.get("track_number") or i
         dur    = e.get("duration")
         filename = None
         if ripped_files:
-            if 0 < i <= len(ripped_files):
-                filename = os.path.basename(ripped_files[i-1])
-            else:
-                filename = os.path.basename(ripped_files[min(len(ripped_files)-1, i-1)])
-
+            filename = os.path.basename(ripped_files[min(len(ripped_files)-1, i-1)])
         tracks.append({
             "index": idx,
             "title": title,
@@ -132,21 +166,19 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
         })
 
     # TRACKLIST.txt
-    tl_lines = []
-    for t in tracks:
-        idx = f"{int(t['index']):02d}" if isinstance(t["index"], int) else "--"
-        artist = t["artist"] or "Unknown Artist"
-        title = t["title"] or (t["filename"] or "Unknown Title")
-        album = t["album"] or ""
-        dur = t["duration_hmmss"]
-        line = f"{idx}. {artist} — {title}"
-        if album:
-            line += f"  ({album})"
-        line += f"  [{dur}]"
-        tl_lines.append(line)
     tl_path = os.path.join(session_dir, "TRACKLIST.txt")
     with open(tl_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(tl_lines) + "\n")
+        for t in tracks:
+            idx = f"{int(t['index']):02d}" if isinstance(t["index"], int) else "--"
+            artist = t["artist"] or "Unknown Artist"
+            title = t["title"] or (t["filename"] or "Unknown Title")
+            album = t["album"] or ""
+            dur = t["duration_hmmss"]
+            line = f"{idx}. {artist} — {title}"
+            if album:
+                line += f"  ({album})"
+            line += f"  [{dur}]"
+            f.write(line + "\n")
 
     # metadata.json
     meta = {
@@ -159,18 +191,15 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     # playlist.m3u8
-    m3u_lines = ["#EXTM3U"]
-    for t in tracks:
-        artist = t["artist"] or "Unknown Artist"
-        title  = t["title"]  or (t["filename"] or "Unknown Title")
-        dur    = int(t["duration"]) if t["duration"] else -1
-        fn     = t["filename"] or title
-        m3u_lines.append(f"#EXTINF:{dur},{artist} - {title}")
-        m3u_lines.append(fn)
     m3u_path = os.path.join(session_dir, "playlist.m3u8")
     with open(m3u_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(m3u_lines) + "\n")
-
+        f.write("#EXTM3U\n")
+        for t in tracks:
+            artist = t["artist"] or "Unknown Artist"
+            title  = t["title"]  or (t["filename"] or "Unknown Title")
+            dur    = int(t["duration"]) if t["duration"] else -1
+            fn     = t["filename"] or title
+            f.write(f"#EXTINF:{dur},{artist} - {title}\n{fn}\n")
     return [tl_path, meta_path, m3u_path]
 
 # ==============================================================
@@ -215,12 +244,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 
     # ---- public notice (animated dots + live counter) ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio… 🦘")
-    public_state = {
-        "dots": 0,
-        "completed": 0,
-        "total": None,  # fill after metadata is fetched
-        "active": True,
-    }
+    public_state = {"dots": 0, "completed": 0, "total": None, "active": True}
     async def public_anim():
         while public_state["active"]:
             dots = "." * (1 + (public_state["dots"] % 3))
@@ -274,8 +298,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 pass
             await asyncio.sleep(tick)
 
-    # ---- progress hook (authoritative) ----
     def progress_hook(d):
+        # Move minimal work off yt-dlp thread; use thread-safe call to update state
         def upd():
             status = d.get("status")
             filename = d.get("filename") or "unknown"
@@ -290,7 +314,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 frag_count = d.get("fragment_count") or d.get("n_fragments")
                 frag_idx   = d.get("fragment_index")
                 p01 = None
-
                 if total and dl is not None:
                     state["total"] = total
                     state["downloaded"] = dl
@@ -302,26 +325,22 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                         p01 = float(d["_percent_str"].replace("%", "")) / 100.0
                     except Exception:
                         p01 = None
-
                 if speed:
                     state["speed"] = speed
                 state["eta"] = d.get("eta")
                 if p01 is not None:
                     state["p01"] = p01
                 state["last_ts"] = time.monotonic()
-
             elif status == "postprocessing":
                 state["status"] = "postprocessing"
                 state["eta"] = None
-
             elif status == "finished":
                 state["status"] = "finished"
                 state["p01"] = 1.0
                 state["eta"] = 0
-                # Increment completed track count for public header
-                public_state["completed"] = max(public_state["completed"] + 1, public_state["completed"])
-
-        asyncio.run_coroutine_threadsafe(asyncio.to_thread(upd), loop)
+                public_state["completed"] += 1
+        # schedule safely on the asyncio loop
+        loop.call_soon_threadsafe(upd)
 
     # ---- yt-dlp options (ID3 tags via FFmpegMetadata) ----
     ydl_opts = {
@@ -332,7 +351,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "noplaylist": False,
+        "noplaylist": False,          # allow playlists (will still rip all)
         "writethumbnail": include_art,
         "skip_download": False,
         "concurrent_fragment_downloads": 5,
@@ -349,7 +368,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     }
 
     # ---- fetch info (playlist size & shared art) ----
-    info = await asyncio.to_thread(extract_info, link, ydl_opts)
+    info = await asyncio.to_thread(extract_info, link, ydl_opts)  # may be None (handle below)
 
     # stop "Initializing..."
     init_active = False
@@ -359,23 +378,24 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         pass
 
     entries = normalize_entries(info)
-    total = len(entries)
-    public_state["total"] = total if total > 0 else None
-    await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
+    total = len(entries) if entries else None
+    public_state["total"] = total
+    await ephemeral.edit(content=f"🎧 Ripping {total if total is not None else 'unknown'} track(s)...")
 
     zip_base = derive_zip_basename(info)
 
-    if include_art and total and total > 1:
-        ydl_opts["writethumbnail"] = False
-        thumb = (info.get("entries") or [{}])[0].get("thumbnail")
-        if thumb:
+    # shared album art (once for sets)
+    if include_art and (total or 0) > 1:
+        thumb_url = find_shared_art_url(info)
+        if thumb_url:
             await ephemeral.edit(content="🎨 Downloading shared album art...")
             art_path = os.path.join(session_dir, "album_art.jpg")
             try:
-                await asyncio.to_thread(download_file, thumb, art_path)
+                await asyncio.to_thread(download_file, thumb_url, art_path)
+                await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
             except Exception:
-                pass
-            await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
+                # ignore failures silently
+                await ephemeral.edit(content="🎨 Continuing rip...")
 
     # ---- run rip + start animator ----
     anim_task = asyncio.create_task(animator())
@@ -443,7 +463,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     # ---- attach the archives
     summary_msg = None
     if len(parts) == 1:
-        # Single ZIP: attach it to the summary. No "Part 1/1" anywhere.
         try:
             summary_msg = await interaction.channel.send(
                 content=(
@@ -460,7 +479,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 )
             )
     else:
-        # Multiple ZIPs: attach Part 1 on the summary, then reply with remaining parts including x/y.
         try:
             summary_msg = await interaction.channel.send(
                 content=(
@@ -476,7 +494,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                     f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
                 )
             )
-
         for i, zp in enumerate(parts[1:], start=2):
             try:
                 await interaction.channel.send(
@@ -565,7 +582,11 @@ def run_ytdlp(link, opts):
 
 def extract_info(link, opts):
     with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(link, download=False)
+        # May return None for some playlist IDs — caller must handle.
+        try:
+            return ydl.extract_info(link, download=False)
+        except Exception:
+            return None
 
 def download_file(url: str, path: str):
     import requests
