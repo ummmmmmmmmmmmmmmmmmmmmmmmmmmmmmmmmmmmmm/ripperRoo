@@ -1,3 +1,4 @@
+# rip_logic.py
 import discord, asyncio, os, tempfile, yt_dlp, time, zipfile, re, json
 from ui_components import ArtChoice, ZipChoice
 from utils import validate_link, clean_dir
@@ -38,7 +39,6 @@ def derive_zip_basename(info: dict | None) -> str:
         return "rip"
     entry = info
     if isinstance(info.get("entries"), list) and info["entries"]:
-        # pick first non-empty entry
         entry = next((e for e in info["entries"] if e), {}) or {}
     artist = (
         entry.get("artist")
@@ -104,18 +104,12 @@ def normalize_entries(info: dict | None) -> list[dict]:
     return [info]
 
 def first_thumbnail_url(obj: dict | None) -> str | None:
-    """
-    Try several common shapes:
-      - obj['thumbnail']
-      - obj['thumbnails'][0]['url'] or ['id']
-    """
+    """Try thumbnail fields across sites."""
     if not obj or not isinstance(obj, dict):
         return None
-    # direct
-    thumb = obj.get("thumbnail")
-    if isinstance(thumb, str) and thumb:
-        return thumb
-    # list
+    t = obj.get("thumbnail")
+    if isinstance(t, str) and t:
+        return t
     thumbs = obj.get("thumbnails")
     if isinstance(thumbs, list) and thumbs:
         first = thumbs[0] or {}
@@ -126,11 +120,9 @@ def find_shared_art_url(info: dict | None) -> str | None:
     """Find a plausible image URL from playlist or first non-empty entry."""
     if not info:
         return None
-    # try playlist-level
     t = first_thumbnail_url(info)
     if t:
         return t
-    # try first non-empty entry
     entries = info.get("entries")
     if isinstance(entries, list):
         for e in entries:
@@ -165,7 +157,6 @@ def build_track_docs(session_dir: str, info: dict | None, ripped_files: list[str
             "filename": filename,
         })
 
-    # TRACKLIST.txt
     tl_path = os.path.join(session_dir, "TRACKLIST.txt")
     with open(tl_path, "w", encoding="utf-8") as f:
         for t in tracks:
@@ -180,17 +171,11 @@ def build_track_docs(session_dir: str, info: dict | None, ripped_files: list[str
             line += f"  [{dur}]"
             f.write(line + "\n")
 
-    # metadata.json
-    meta = {
-        "zip_basename": derive_zip_basename(info),
-        "count": len(tracks),
-        "tracks": tracks,
-    }
+    meta = {"zip_basename": derive_zip_basename(info), "count": len(tracks), "tracks": tracks}
     meta_path = os.path.join(session_dir, "metadata.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # playlist.m3u8
     m3u_path = os.path.join(session_dir, "playlist.m3u8")
     with open(m3u_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -223,11 +208,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await art_view.wait()
     include_art = art_view.choice or False
 
-    # Thank-you line → then Initializing… animation
-    await ephemeral.edit(
-        content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘",
-        view=None
-    )
+    # Thank-you → then Initializing…
+    await ephemeral.edit(content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘", view=None)
     await asyncio.sleep(0.8)
 
     init_active = True
@@ -264,7 +246,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     # ---- temp working folder ----
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
 
-    # ---- progress state + background animator for ephemeral card ----
+    # ---- progress state + background animator (ephemeral card) ----
     loop = asyncio.get_running_loop()
     state = {
         "title": "…",
@@ -278,6 +260,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "active": True,
         "last_ts": time.monotonic(),
     }
+    download_counters = {"ok": 0, "skipped": 0}
 
     async def animator():
         tick = 0.13  # ~7–8 fps
@@ -299,7 +282,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             await asyncio.sleep(tick)
 
     def progress_hook(d):
-        # Move minimal work off yt-dlp thread; use thread-safe call to update state
+        # fast thread-safe update
         def upd():
             status = d.get("status")
             filename = d.get("filename") or "unknown"
@@ -339,43 +322,56 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 state["p01"] = 1.0
                 state["eta"] = 0
                 public_state["completed"] += 1
-        # schedule safely on the asyncio loop
+                download_counters["ok"] += 1
+            elif status == "error":
+                download_counters["skipped"] += 1
         loop.call_soon_threadsafe(upd)
 
-    # ---- yt-dlp options (ID3 tags via FFmpegMetadata) ----
+    # ---- yt-dlp options (robust for YT playlists) ----
     ydl_opts = {
-        "format": "bestaudio/best",
+        # Prefer m4a, then webm/opus, then any audio → best
+        "format": "ba[ext=m4a]/ba[acodec^=mp4a]/ba[ext=webm]/ba/bestaudio/best",
+
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
         "logger": _QuietLogger(),
         "noprogress": True,
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": True,
-        "noplaylist": False,          # allow playlists (will still rip all)
-        "writethumbnail": include_art,
-        "skip_download": False,
-        "concurrent_fragment_downloads": 5,
+
+        # Keep going on items with no formats
+        "ignore_no_formats_error": True,
+        "extractor_retries": 3,
+        "skip_unavailable_fragments": True,
+
+        # network robustness
         "retries": 5,
         "fragment_retries": 5,
         "buffersize": 128 * 1024,
         "continuedl": True,
         "socket_timeout": 10,
+
+        "noplaylist": False,          # allow playlists
+        "writethumbnail": include_art,
+        "skip_download": False,
+
         "progress_hooks": [progress_hook],
+
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(TARGET_ABR)},
             {"key": "FFmpegMetadata"},
         ],
+
+        # Slight nudge that sometimes helps YouTube format lists
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
     }
 
     # ---- fetch info (playlist size & shared art) ----
-    info = await asyncio.to_thread(extract_info, link, ydl_opts)  # may be None (handle below)
+    info = await asyncio.to_thread(extract_info, link, ydl_opts)  # may be None
 
     # stop "Initializing..."
     init_active = False
-    try:
-        await init_task
-    except Exception:
-        pass
+    try: await init_task
+    except Exception: pass
 
     entries = normalize_entries(info)
     total = len(entries) if entries else None
@@ -394,7 +390,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 await asyncio.to_thread(download_file, thumb_url, art_path)
                 await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
             except Exception:
-                # ignore failures silently
                 await ephemeral.edit(content="🎨 Continuing rip...")
 
     # ---- run rip + start animator ----
@@ -403,21 +398,27 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await asyncio.sleep(0.4)
 
     state["active"] = False
-    try:
-        await anim_task
-    except Exception:
-        pass
+    try: await anim_task
+    except Exception: pass
 
     # ---- collect output files ----
     files = [os.path.join(session_dir, f) for f in os.listdir(session_dir) if f.lower().endswith(".mp3")]
     files.sort()
     total_done = len(files)
-    if total_done == 0:
-        public_state["active"] = False
+
+    # Inform if playlist had unavailable items
+    if total and total_done < total:
+        skipped = total - total_done
         try:
-            await public_task
+            await ephemeral.edit(content=f"ℹ️ Some items had no playable audio and were skipped ({skipped}/{total}). Continuing…")
+            await asyncio.sleep(0.6)
         except Exception:
             pass
+
+    if total_done == 0:
+        public_state["active"] = False
+        try: await public_task
+        except Exception: pass
         await ephemeral.edit(content="❌ No audio files were downloaded.")
         clean_dir(session_dir)
         return
@@ -434,10 +435,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     parts = build_zip_parts(files, session_dir, target_part_size, zip_base, extra_first=extra_docs)
     if not parts:
         public_state["active"] = False
-        try:
-            await public_task
-        except Exception:
-            pass
+        try: await public_task
+        except Exception: pass
         too_big = max((os.path.getsize(f), f) for f in files)[1]
         mb = round(os.path.getsize(too_big) / (1024 * 1024), 2)
         await ephemeral.edit(content=f"⚠️ A track is {mb} MB and exceeds this server’s upload limit. Unable to send.")
@@ -446,14 +445,10 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 
     # ---- close public header animator and replace with final summary ----
     public_state["active"] = False
-    try:
-        await public_task
-    except Exception:
-        pass
-    try:
-        await public_msg.delete()
-    except Exception:
-        pass
+    try: await public_task
+    except Exception: pass
+    try: await public_msg.delete()
+    except Exception: pass
 
     elapsed = int(time.monotonic() - start_ts)
     mins, secs = divmod(elapsed, 60)
@@ -465,34 +460,26 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     if len(parts) == 1:
         try:
             summary_msg = await interaction.channel.send(
-                content=(
-                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
-                ),
+                content=(f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                         f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"),
                 file=discord.File(parts[0]),
             )
         except Exception:
             summary_msg = await interaction.channel.send(
-                content=(
-                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
-                )
+                content=(f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                         f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘")
             )
     else:
         try:
             summary_msg = await interaction.channel.send(
-                content=(
-                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
-                ),
+                content=(f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                         f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"),
                 file=discord.File(parts[0]),
             )
         except Exception:
             summary_msg = await interaction.channel.send(
-                content=(
-                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
-                )
+                content=(f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                         f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘")
             )
         for i, zp in enumerate(parts[1:], start=2):
             try:
@@ -582,7 +569,6 @@ def run_ytdlp(link, opts):
 
 def extract_info(link, opts):
     with yt_dlp.YoutubeDL(opts) as ydl:
-        # May return None for some playlist IDs — caller must handle.
         try:
             return ydl.extract_info(link, download=False)
         except Exception:
