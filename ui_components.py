@@ -15,7 +15,6 @@ class ArtChoice(discord.ui.View):
         self.choice = False
         await interaction.response.edit_message(content="🚫 No album art.", view=None)
 
-
 class ZipChoice(discord.ui.View):
     def __init__(self, timeout: int = 30):
         super().__init__(timeout=timeout)

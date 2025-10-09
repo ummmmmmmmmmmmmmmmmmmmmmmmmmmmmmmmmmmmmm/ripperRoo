@@ -1,0 +1,7 @@
+downloads/
+__pycache__/
+*.part
+*.opus
+*.jpg
+*.mp3
+*.zip
