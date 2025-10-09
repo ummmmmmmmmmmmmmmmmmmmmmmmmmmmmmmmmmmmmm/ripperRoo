@@ -1,4 +1,3 @@
-# rip_logic.py
 import discord, asyncio, os, tempfile, yt_dlp, time, zipfile, re, json
 from ui_components import ArtChoice, ZipChoice
 from utils import validate_link, clean_dir
@@ -195,7 +194,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await art_view.wait()
     include_art = art_view.choice or False
 
-    # ✅ Replace with thank-you line, then immediately “Initializing…”
+    # Thank-you line → then Initializing… animation
     await ephemeral.edit(
         content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘",
         view=None
@@ -214,13 +213,34 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             await asyncio.sleep(0.35)
     init_task = asyncio.create_task(init_anim())
 
-    # ---- public notice (to be replaced with final kangaroo summary) ----
-    public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
+    # ---- public notice (animated dots + live counter) ----
+    public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio… 🦘")
+    public_state = {
+        "dots": 0,
+        "completed": 0,
+        "total": None,  # fill after metadata is fetched
+        "active": True,
+    }
+    async def public_anim():
+        while public_state["active"]:
+            dots = "." * (1 + (public_state["dots"] % 3))
+            total = public_state["total"]
+            if total is None:
+                text = f"{interaction.user.mention} is ripping audio{dots} 🦘"
+            else:
+                text = f"{interaction.user.mention} is ripping audio{dots} ({public_state['completed']}/{total}) 🦘"
+            try:
+                await public_msg.edit(content=text)
+            except Exception:
+                pass
+            public_state["dots"] += 1
+            await asyncio.sleep(0.9)
+    public_task = asyncio.create_task(public_anim())
 
     # ---- temp working folder ----
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
 
-    # ---- progress state + background animator ----
+    # ---- progress state + background animator for ephemeral card ----
     loop = asyncio.get_running_loop()
     state = {
         "title": "…",
@@ -254,6 +274,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 pass
             await asyncio.sleep(tick)
 
+    # ---- progress hook (authoritative) ----
     def progress_hook(d):
         def upd():
             status = d.get("status")
@@ -297,6 +318,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 state["status"] = "finished"
                 state["p01"] = 1.0
                 state["eta"] = 0
+                # Increment completed track count for public header
+                public_state["completed"] = max(public_state["completed"] + 1, public_state["completed"])
 
         asyncio.run_coroutine_threadsafe(asyncio.to_thread(upd), loop)
 
@@ -312,18 +335,16 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "noplaylist": False,
         "writethumbnail": include_art,
         "skip_download": False,
-        # speed/robustness
         "concurrent_fragment_downloads": 5,
         "retries": 5,
         "fragment_retries": 5,
         "buffersize": 128 * 1024,
         "continuedl": True,
         "socket_timeout": 10,
-        # progress + postprocessors
         "progress_hooks": [progress_hook],
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(TARGET_ABR)},
-            {"key": "FFmpegMetadata"},  # write title/artist/album/track when available
+            {"key": "FFmpegMetadata"},
         ],
     }
 
@@ -339,6 +360,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 
     entries = normalize_entries(info)
     total = len(entries)
+    public_state["total"] = total if total > 0 else None
     await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
 
     zip_base = derive_zip_basename(info)
@@ -371,28 +393,43 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     files.sort()
     total_done = len(files)
     if total_done == 0:
+        public_state["active"] = False
+        try:
+            await public_task
+        except Exception:
+            pass
         await ephemeral.edit(content="❌ No audio files were downloaded.")
         clean_dir(session_dir)
         return
 
-    # ---- build TRACKLIST.txt / metadata.json / playlist.m3u8 ----
+    # ---- build docs ----
     extra_docs = build_track_docs(session_dir, info, files)
 
     # ---- detect server upload limit (bytes) ----
     upload_limit = int(getattr(interaction.guild, "filesize_limit", 8 * 1024 * 1024))
     target_part_size = max(1, upload_limit - 256 * 1024)
 
-    # ---- zip into parts under limit (docs go in Part 1) ----
+    # ---- zip into parts (docs in Part 1) ----
     await ephemeral.edit(content="📦 Packaging tracks for Discord…")
     parts = build_zip_parts(files, session_dir, target_part_size, zip_base, extra_first=extra_docs)
     if not parts:
+        public_state["active"] = False
+        try:
+            await public_task
+        except Exception:
+            pass
         too_big = max((os.path.getsize(f), f) for f in files)[1]
         mb = round(os.path.getsize(too_big) / (1024 * 1024), 2)
         await ephemeral.edit(content=f"⚠️ A track is {mb} MB and exceeds this server’s upload limit. Unable to send.")
         clean_dir(session_dir)
         return
 
-    # ---- replace the public notice with final summary (kangaroo) + attach Part 1 ----
+    # ---- close public header animator and replace with final summary ----
+    public_state["active"] = False
+    try:
+        await public_task
+    except Exception:
+        pass
     try:
         await public_msg.delete()
     except Exception:
@@ -403,35 +440,53 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     elapsed_text = f"{mins:02d}:{secs:02d}"
     source_md = f"[Source]({link})"
 
-    first = parts[0]
+    # ---- attach the archives
     summary_msg = None
-    try:
-        summary_msg = await interaction.channel.send(
-            content=(
-                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-                f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
-            ),
-            file=discord.File(first),
-        )
-    except Exception:
-        summary_msg = await interaction.channel.send(
-            content=(
-                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
-                f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
-            )
-        )
-
-    # ---- reply with remaining parts under the summary ----
-    for i, zp in enumerate(parts[1:], start=2):
+    if len(parts) == 1:
+        # Single ZIP: attach it to the summary. No "Part 1/1" anywhere.
         try:
-            await interaction.channel.send(
-                content=f"📦 {zip_base} — Part {i}/{len(parts)}",
-                file=discord.File(zp),
-                reference=summary_msg
+            summary_msg = await interaction.channel.send(
+                content=(
+                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
+                ),
+                file=discord.File(parts[0]),
             )
         except Exception:
-            pass
-        await asyncio.sleep(0.25)
+            summary_msg = await interaction.channel.send(
+                content=(
+                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
+                )
+            )
+    else:
+        # Multiple ZIPs: attach Part 1 on the summary, then reply with remaining parts including x/y.
+        try:
+            summary_msg = await interaction.channel.send(
+                content=(
+                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
+                ),
+                file=discord.File(parts[0]),
+            )
+        except Exception:
+            summary_msg = await interaction.channel.send(
+                content=(
+                    f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                    f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
+                )
+            )
+
+        for i, zp in enumerate(parts[1:], start=2):
+            try:
+                await interaction.channel.send(
+                    content=f"{zip_base} — Part {i}/{len(parts)}",
+                    file=discord.File(zp),
+                    reference=summary_msg
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
 
     await ephemeral.edit(content="✅ Done! Cleaning up…")
     clean_dir(session_dir)
@@ -473,7 +528,7 @@ def build_zip_parts(
         return zip_name
 
     idx = 1
-    # Put docs first (Part 1)
+    # Put docs first into Part 1
     for doc in extra_first:
         size = os.path.getsize(doc)
         if total_in_bundle and (total_in_bundle + size) > part_limit_bytes:
