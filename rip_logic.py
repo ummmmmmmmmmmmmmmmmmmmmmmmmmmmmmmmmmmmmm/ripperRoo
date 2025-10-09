@@ -4,7 +4,7 @@ from utils import validate_link, clean_dir
 from config import ALLOWED_DOMAINS
 
 TARGET_ABR = 192   # kbps
-BAR_LEN     = 50   # visual width for the bar
+BAR_LEN     = 50   # progress bar width
 FILLED_CHAR = "♪"
 EMPTY_CHAR  = "-"
 
@@ -33,9 +33,7 @@ def derive_zip_basename(info: dict) -> str:
     Else:   Artist - Title
     Else:   Title
     Fallback: rip
-    Works for single and playlist results.
     """
-    # Single or first entry fields
     entry = info
     if info and isinstance(info.get("entries"), list) and info["entries"]:
         entry = info["entries"][0] or {}
@@ -107,9 +105,8 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await ephemeral.edit(content="🎨 Include album art?", view=art_view)
     await art_view.wait()
     include_art = art_view.choice or False
-    await ephemeral.edit(content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}.")
 
-    # ---- show animated "Initializing..." while we prep ----
+    # Immediately switch to "Initializing..." on the SAME ephemeral message
     init_active = True
     async def init_anim():
         i = 0
@@ -119,10 +116,10 @@ async def handle_rip(interaction: discord.Interaction, link: str):
             except Exception:
                 pass
             i += 1
-            await asyncio.sleep(0.35)  # nice tempo for dots
+            await asyncio.sleep(0.35)
     init_task = asyncio.create_task(init_anim())
 
-    # ---- public notice (to be replaced later with download attached) ----
+    # ---- public notice (to be replaced with the final kangaroo summary) ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
     # ---- temp working folder ----
@@ -207,7 +204,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 state["p01"] = 1.0
                 state["eta"] = 0
 
-        # schedule onto main loop
         asyncio.run_coroutine_threadsafe(asyncio.to_thread(upd), loop)
 
     # ---- yt-dlp options ----
@@ -317,16 +313,16 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     try:
         summary_msg = await interaction.channel.send(
             content=(
-                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
-                f"{elapsed_text} @{TARGET_ABR} kbps · {source_md} · Download (Part 1/{len(parts)}) ✅"
+                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
             ),
             file=discord.File(first),
         )
     except Exception:
         summary_msg = await interaction.channel.send(
             content=(
-                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — "
-                f"{elapsed_text} @{TARGET_ABR} kbps · {source_md} ✅"
+                f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** "
+                f"for {elapsed_text} @ {TARGET_ABR} kbps · {source_md} 🦘"
             )
         )
 
@@ -334,7 +330,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     for i, zp in enumerate(parts[1:], start=2):
         try:
             await interaction.channel.send(
-                content=f"📦 Part {i}/{len(parts)}",
+                content=f"📦 {zip_base} — Part {i}/{len(parts)}",
                 file=discord.File(zp),
                 reference=summary_msg
             )
