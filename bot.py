@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from config import TOKEN
-from rip_logic import handle_rip
+from rip_core import handle_rip
 from utils import auto_clean_temp
 
 intents = discord.Intents.default()
