@@ -1,9 +1,8 @@
 # rip_core.py
 import os, tempfile, time, json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 from constants import (
-    TARGET_ABR_KBPS, DEFAULT_ZIP_PART_MB,
-    YTDLP_FORMAT_FALLBACK,
+    TARGET_ABR_KBPS, DEFAULT_ZIP_PART_MB, YTDLP_FORMAT_FALLBACK,
 )
 from ytdlp_wrapper import extract_info, download_all
 from packager import build_zip_parts
@@ -90,36 +89,45 @@ def _write_docs(session_dir: str, info: Optional[dict], audio_files: List[str]) 
             f.write(f"#EXTINF:{dur},{artist} - {title}\n{fn}\n")
     return [tl, meta_path, m3u]
 
+def _all_parts_under(parts: List[str], limit: int) -> bool:
+    return all(os.path.getsize(p) < limit for p in parts)
+
 def rip_to_zips(
     url: str,
     include_art: bool,
     zip_part_limit_bytes: int = DEFAULT_ZIP_PART_MB * 1024 * 1024,
+    progress_cb: Optional[Callable[[dict], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Downloads (playlist-safe) with yt-dlp, converts to MP3 (yt-dlp ffmpeg pp),
-    writes docs, zips into parts <= zip_part_limit_bytes.
+    Downloads (playlist-safe) with yt-dlp (using ffmpeg postprocessor → MP3),
+    streams progress via progress_cb(dict), writes docs, and zips into parts.
+    Returns { 'zips': [...], 'count', 'duration_hmmss', 'bitrate', 'zip_base', 'work_dir' }.
     """
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
 
     # Probe info for naming/tracklist (non-fatal)
     info = extract_info(url, session_dir, include_art)
 
-    # PASS 1: strict format chain + yt-dlp postprocessor → MP3
-    download_all(url, session_dir, include_art,
-                 progress_hook=None,
-                 format_str=None,
-                 use_pp_mp3=True,
-                 abr_kbps=TARGET_ABR_KBPS)
+    # PASS 1: strict chain + MP3 via ffmpeg postprocessor
+    download_all(
+        url, session_dir, include_art,
+        progress_hook=progress_cb,
+        format_str=None,
+        use_pp_mp3=True,
+        abr_kbps=TARGET_ABR_KBPS
+    )
 
     files = _collect_audio_files(session_dir)
 
-    # PASS 2: if nothing was created, retry with a very loose format
+    # PASS 2: looser format if nothing grabbed
     if not files:
-        download_all(url, session_dir, include_art,
-                     progress_hook=None,
-                     format_str=YTDLP_FORMAT_FALLBACK,
-                     use_pp_mp3=True,
-                     abr_kbps=TARGET_ABR_KBPS)
+        download_all(
+            url, session_dir, include_art,
+            progress_hook=progress_cb,
+            format_str=YTDLP_FORMAT_FALLBACK,
+            use_pp_mp3=True,
+            abr_kbps=TARGET_ABR_KBPS
+        )
         files = _collect_audio_files(session_dir)
 
     if not files:
@@ -128,12 +136,26 @@ def rip_to_zips(
     # Docs + playlist
     docs = _write_docs(session_dir, info, files)
 
-    # Zip parts
-    zip_base = _derive_zip_basename(info)
-    zips = build_zip_parts(files, session_dir, zip_base, zip_part_limit_bytes, extra_first=docs)
-    if not zips:
+    # Build parts, then *verify* and shrink if any part >= limit (zip overhead can push over)
+    base = _derive_zip_basename(info)
+    margin = max(256 * 1024, int(zip_part_limit_bytes * 0.03))   # 3% or 256 KiB
+    target = max(1, zip_part_limit_bytes - margin)
+
+    def build(target_size: int) -> List[str]:
+        return build_zip_parts(files, session_dir, base, target_size, extra_first=docs)
+
+    parts = build(target)
+    if not parts:
         biggest = max((os.path.getsize(f), f) for f in files)[1]
         raise RuntimeError(f"Track too large for part limit: {os.path.basename(biggest)}")
+
+    # Iteratively shrink (safety) until all parts < (limit - margin)
+    if not _all_parts_under(parts, target):
+        for scale in (0.85, 0.75, 0.66, 0.5, 0.4, 0.33, 0.25):
+            target = max(1, int((zip_part_limit_bytes - margin) * scale))
+            parts = build(target)
+            if parts and _all_parts_under(parts, zip_part_limit_bytes - margin):
+                break
 
     # Duration (best-effort: sum entry durations)
     total_sec = 0
@@ -143,10 +165,10 @@ def rip_to_zips(
     dur_hmmss = _hmmss(total_sec if total_sec > 0 else None)
 
     return {
-        "zips": zips,
+        "zips": parts,
         "count": len(files),
         "duration_hmmss": dur_hmmss,
         "bitrate": TARGET_ABR_KBPS,
-        "zip_base": zip_base,
+        "zip_base": base,
         "work_dir": session_dir,
     }
