@@ -170,16 +170,9 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
 # MAIN RIP COMMAND
 # ==============================================================
 
+
 async def handle_rip(interaction: discord.Interaction, link: str):
-    start_ts = time.monotonic()
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    ephemeral = await interaction.followup.send("✅ Received. Checking link...", ephemeral=True)
-
-    # ---- validate domain ----
-    if not validate_link(link, ALLOWED_DOMAINS):
-        await ephemeral.edit(content="❌ Unsupported or invalid link.")
-        return
+    # ... your existing setup code above ...
 
     # ---- ask for album art ----
     art_view = ArtChoice()
@@ -187,19 +180,22 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await art_view.wait()
     include_art = art_view.choice or False
 
-    # ✅ Replace the confirmation with the thank-you line,
-    #    then immediately transition into the Initializing… animation.
+    # ✅ Replace the confirmation with your thank-you line,
+    #    then immediately transition to the Initializing… animation
     await ephemeral.edit(
-        content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘"
+        content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘",
+        view=None
     )
-    await asyncio.sleep(0.8)  # brief acknowledgment so users can read it
+    await asyncio.sleep(0.8)  # short acknowledgment so users can read it
 
+    # ---- animated 'Initializing…' on the SAME ephemeral message ----
     init_active = True
     async def init_anim():
         i = 0
         while init_active:
             try:
-                await ephemeral.edit(content=render_initializing_frame(i))
+                dots = "." * (1 + (i % 3))
+                await ephemeral.edit(content=f"🛠️ Initializing{dots}")
             except Exception:
                 pass
             i += 1
