@@ -1,8 +1,14 @@
 import os
 
-# ===== BOT CONFIG =====
-TOKEN = os.getenv("DISCORD_TOKEN")  # Set this in PowerShell: $env:DISCORD_TOKEN='YOUR_TOKEN'
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", r"C:\ffmpeg\bin")  # adjust path if needed
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Allowed domains
-ALLOWED_DOMAINS = {"youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "bandcamp.com"}
+ALLOWED_DOMAINS = {
+    "youtube.com", "youtu.be",
+    "soundcloud.com",
+    "vimeo.com",
+    "dailymotion.com"
+}
+
+# temp download path
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)

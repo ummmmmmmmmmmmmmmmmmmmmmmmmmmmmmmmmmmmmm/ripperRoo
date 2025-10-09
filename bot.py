@@ -10,14 +10,11 @@ bot = commands.Bot(command_prefix="*", intents=intents)
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(f"❌ Sync failed: {e}")
+    await bot.tree.sync()
+    print("✅ Slash commands synced.")
 
-@bot.tree.command(name="rip", description="Rip audio from YouTube, SoundCloud, Bandcamp, etc.")
-@app_commands.describe(link="Provide the media link")
+@bot.tree.command(name="rip", description="Rip audio from supported sites")
+@app_commands.describe(link="Paste a YouTube, SoundCloud, Vimeo, or Dailymotion link")
 async def rip(interaction: discord.Interaction, link: str):
     await handle_rip(interaction, link)
 
