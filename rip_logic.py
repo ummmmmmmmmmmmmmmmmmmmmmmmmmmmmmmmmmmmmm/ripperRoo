@@ -94,7 +94,6 @@ def _seconds_to_hmmss(sec: int | float | None) -> str:
     return f"{m:02d}:{s:02d}"
 
 def normalize_entries(info: dict) -> list[dict]:
-    """Return a list of extractor entries (single becomes [info])."""
     if not info:
         return []
     if isinstance(info.get("entries"), list) and info["entries"]:
@@ -102,21 +101,15 @@ def normalize_entries(info: dict) -> list[dict]:
     return [info]
 
 def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> list[str]:
-    """
-    Create TRACKLIST.txt, metadata.json, and playlist.m3u8 in session_dir.
-    Returns the list of created file paths (to be bundled into ZIP Part 1).
-    """
     entries = normalize_entries(info)
 
-    # Build a canonical per-track list with best-effort fields
     tracks = []
     for i, e in enumerate(entries, start=1):
         title  = e.get("track") or e.get("title") or ""
         artist = e.get("artist") or e.get("uploader") or e.get("channel") or ""
         album  = e.get("album") or info.get("playlist_title") or info.get("playlist") or ""
         idx    = e.get("playlist_index") or e.get("track_number") or i
-        dur    = e.get("duration")  # seconds
-        # Find the actual ripped filename that likely matches this entry (best effort by index)
+        dur    = e.get("duration")
         filename = None
         if ripped_files:
             if 0 < i <= len(ripped_files):
@@ -134,7 +127,6 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
             "filename": filename,
         })
 
-    # TRACKLIST.txt
     tl_lines = []
     for t in tracks:
         idx = f"{int(t['index']):02d}" if isinstance(t["index"], int) else "--"
@@ -151,7 +143,6 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
     with open(tl_path, "w", encoding="utf-8") as f:
         f.write("\n".join(tl_lines) + "\n")
 
-    # metadata.json
     meta = {
         "zip_basename": derive_zip_basename(info),
         "count": len(tracks),
@@ -161,7 +152,6 @@ def build_track_docs(session_dir: str, info: dict, ripped_files: list[str]) -> l
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # playlist.m3u8
     m3u_lines = ["#EXTM3U"]
     for t in tracks:
         artist = t["artist"] or "Unknown Artist"
@@ -197,7 +187,13 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     await art_view.wait()
     include_art = art_view.choice or False
 
-    # Immediately switch to "Initializing..." on the SAME ephemeral message
+    # ✅ Replace the confirmation with the thank-you line,
+    #    then immediately transition into the Initializing… animation.
+    await ephemeral.edit(
+        content="Thank you for using Ripper Roo, your download will begin momentarily... 🦘"
+    )
+    await asyncio.sleep(0.8)  # brief acknowledgment so users can read it
+
     init_active = True
     async def init_anim():
         i = 0
@@ -224,15 +220,15 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "total": None,
         "eta": None,
         "abr": TARGET_ABR,
-        "speed": None,        # bytes/sec
-        "p01": 0.0,           # 0..1
-        "status": "idle",     # downloading | postprocessing | finished
+        "speed": None,
+        "p01": 0.0,
+        "status": "idle",
         "active": True,
         "last_ts": time.monotonic(),
     }
 
     async def animator():
-        tick = 0.13  # ~7–8 fps
+        tick = 0.13
         while state["active"]:
             try:
                 p = state["p01"]
@@ -250,7 +246,6 @@ async def handle_rip(interaction: discord.Interaction, link: str):
                 pass
             await asyncio.sleep(tick)
 
-    # ---- progress hook (authoritative) ----
     def progress_hook(d):
         def upd():
             status = d.get("status")
@@ -297,8 +292,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
 
         asyncio.run_coroutine_threadsafe(asyncio.to_thread(upd), loop)
 
-    # ---- yt-dlp options ----
-    # NOTE: We add FFmpegMetadata to write ID3 tags into MP3s.
+    # ---- yt-dlp options (ID3 tags via FFmpegMetadata) ----
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
@@ -308,21 +302,18 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": False,
-        "writethumbnail": include_art,    # may be disabled for playlists below
+        "writethumbnail": include_art,
         "skip_download": False,
-        # speed/robustness
         "concurrent_fragment_downloads": 5,
         "retries": 5,
         "fragment_retries": 5,
         "buffersize": 128 * 1024,
         "continuedl": True,
         "socket_timeout": 10,
-        # progress
         "progress_hooks": [progress_hook],
-        # audio extraction + metadata tags
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(TARGET_ABR)},
-            {"key": "FFmpegMetadata"},  # <- write ID3 tags (title/artist/album/track)
+            {"key": "FFmpegMetadata"},  # write title/artist/album/track when available
         ],
     }
 
@@ -340,13 +331,9 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     total = len(entries)
     await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
 
-    # base name for zip parts
     zip_base = derive_zip_basename(info)
 
-    # ---- album art optimization (once for sets) ----
     if include_art and total and total > 1:
-        # We avoid per-track thumbnails; if you ever want embedded art per track,
-        # you'd need to fetch/embed per-file. Here we just keep a shared image.
         ydl_opts["writethumbnail"] = False
         thumb = (info.get("entries") or [{}])[0].get("thumbnail")
         if thumb:
@@ -361,7 +348,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     # ---- run rip + start animator ----
     anim_task = asyncio.create_task(animator())
     await asyncio.to_thread(run_ytdlp, link, ydl_opts)
-    await asyncio.sleep(0.4)  # let handles close
+    await asyncio.sleep(0.4)
 
     state["active"] = False
     try:
@@ -378,14 +365,14 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         clean_dir(session_dir)
         return
 
-    # ---- create track docs (TRACKLIST.txt, metadata.json, playlist.m3u8) ----
+    # ---- build TRACKLIST.txt / metadata.json / playlist.m3u8 ----
     extra_docs = build_track_docs(session_dir, info, files)
 
     # ---- detect server upload limit (bytes) ----
     upload_limit = int(getattr(interaction.guild, "filesize_limit", 8 * 1024 * 1024))
-    target_part_size = max(1, upload_limit - 256 * 1024)  # headroom
+    target_part_size = max(1, upload_limit - 256 * 1024)
 
-    # ---- zip into parts under limit, using the derived base name (docs go in Part 1) ----
+    # ---- zip into parts under limit (docs go in Part 1) ----
     await ephemeral.edit(content="📦 Packaging tracks for Discord…")
     parts = build_zip_parts(files, session_dir, target_part_size, zip_base, extra_first=extra_docs)
     if not parts:
@@ -395,7 +382,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         clean_dir(session_dir)
         return
 
-    # ---- delete the original public notice and post summary WITH first part attached ----
+    # ---- replace the public notice with final summary (kangaroo) + attach Part 1 ----
     try:
         await public_msg.delete()
     except Exception:
@@ -455,12 +442,6 @@ def build_zip_parts(
     base_name: str,
     extra_first: list[str] | None = None
 ) -> list[str]:
-    """
-    Create multiple ZIP files, each <= part_limit_bytes.
-    Uses ZIP_STORED (no compression) so size ~ sum(mp3 sizes) + tiny header.
-    Names like: 'Artist - Album_part_01.zip'
-    Ensures extra_first files (tracklist, metadata, m3u8) go into Part 1.
-    """
     extra_first = extra_first or []
     parts: list[str] = []
     bundle: list[str] = []
@@ -476,21 +457,20 @@ def build_zip_parts(
                 zf.write(fp, arcname)
         return zip_name
 
-    # Start Part 1 with docs if they fit
     idx = 1
+    # Put docs first (Part 1)
     for doc in extra_first:
         size = os.path.getsize(doc)
         if total_in_bundle and (total_in_bundle + size) > part_limit_bytes:
-            zp = flush_bundle(idx); 
+            zp = flush_bundle(idx)
             if zp: parts.append(zp); idx += 1
             bundle = []; total_in_bundle = 0
         bundle.append(doc); total_in_bundle += size
 
-    # Add audio files into parts
     for fp in files:
         size = os.path.getsize(fp)
         if size > part_limit_bytes and len(files) == 1:
-            return []  # a single huge file can't be sent
+            return []
         if total_in_bundle and (total_in_bundle + size) > part_limit_bytes:
             zp = flush_bundle(idx)
             if zp:
@@ -498,7 +478,6 @@ def build_zip_parts(
             bundle = []; total_in_bundle = 0
         bundle.append(fp); total_in_bundle += size
 
-    # flush last bundle
     zp = flush_bundle(idx)
     if zp:
         parts.append(zp)
@@ -517,7 +496,6 @@ def extract_info(link, opts):
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(link, download=False)
 
-# simple HTTP fetcher (for shared album art)
 def download_file(url: str, path: str):
     import requests
     r = requests.get(url, stream=True, timeout=10)
