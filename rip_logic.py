@@ -1,23 +1,38 @@
-import discord, asyncio, os, tempfile, yt_dlp, time
+import discord, asyncio, os, tempfile, yt_dlp, time, math
 from datetime import datetime
 from ui_components import ArtChoice, ZipChoice
 from utils import progress_bar, validate_link, zip_folder, clean_dir
 from config import ALLOWED_DOMAINS
 
+DISCORD_MAX = 8 * 1024 * 1024  # 8 MB
+
+# -------------------- Quiet logger for yt-dlp (no terminal spam) --------------------
+class _QuietLogger:
+    def debug(self, msg):  # swallow progress lines
+        pass
+    def info(self, msg):
+        pass
+    def warning(self, msg):
+        pass
+    def error(self, msg):
+        print(msg)
 
 # ==============================================================
 # MAIN RIP COMMAND
 # ==============================================================
 
 async def handle_rip(interaction: discord.Interaction, link: str):
+    start_ts = time.monotonic()
+
     await interaction.response.defer(ephemeral=True, thinking=True)
     ephemeral = await interaction.followup.send("✅ Received. Checking link...", ephemeral=True)
 
+    # ---- validate domain ----
     if not validate_link(link, ALLOWED_DOMAINS):
         await ephemeral.edit(content="❌ Unsupported or invalid link.")
         return
 
-    # Ask for album art
+    # ---- ask for album art ----
     art_view = ArtChoice()
     await ephemeral.edit(content="🎨 Include album art?", view=art_view)
     await art_view.wait()
@@ -26,38 +41,39 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         content=f"{'✅' if include_art else '🚫'} Album art will be {'included' if include_art else 'excluded'}."
     )
 
+    # ---- public notice ----
     public_msg = await interaction.channel.send(f"{interaction.user.mention} is ripping audio... 🎧")
 
+    # ---- temp working folder ----
     session_dir = tempfile.mkdtemp(prefix="ripperroo_")
+
+    # ---- capture main loop for cross-thread updates ----
     loop = asyncio.get_running_loop()
+    last_update = {"t": 0.0}
 
-    # ----------------------------------------------------------
-    # Progress Hook — sends updates to Discord (throttled)
-    # ----------------------------------------------------------
-    last_update = {"time": 0}
-
+    # ---- progress hook (throttled) ----
     def progress_hook(d):
         now = time.time()
-        # limit updates to every 0.5s to prevent Discord spam
-        if now - last_update["time"] < 0.5:
+        if now - last_update["t"] < 0.5:
             return
-        last_update["time"] = now
+        last_update["t"] = now
         asyncio.run_coroutine_threadsafe(on_progress(d, ephemeral), loop)
 
-    # ----------------------------------------------------------
-    # yt-dlp Config
-    # ----------------------------------------------------------
+    # ---- yt-dlp options ----
+    target_bitrate_kbps = 192
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(session_dir, "%(title)s.%(ext)s"),
-        "quiet": True,                      # fully suppress console output
+        "logger": _QuietLogger(),
+        "noprogress": True,                 # do not print progress in terminal
+        "quiet": True,
         "no_warnings": True,
-        "progress_with_newline": False,     # stops terminal progress
+        "progress_with_newline": False,
         "ignoreerrors": True,
         "noplaylist": False,
         "writethumbnail": include_art,
         "skip_download": False,
-        "concurrent_fragment_downloads": 5,
+        "concurrent_fragment_downloads": 5, # faster
         "retries": 5,
         "fragment_retries": 5,
         "buffersize": 128 * 1024,
@@ -65,48 +81,44 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         "socket_timeout": 10,
         "progress_hooks": [progress_hook],
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(target_bitrate_kbps)},
         ],
     }
 
-    # ----------------------------------------------------------
-    # Fetch Info (playlist detection)
-    # ----------------------------------------------------------
+    # ---- fetch info (for playlist size & shared art) ----
     await ephemeral.edit(content="🎵 Fetching playlist info...")
     info = await asyncio.to_thread(extract_info, link, ydl_opts)
     entries = info.get("entries", [info]) if info else []
     total = len(entries)
     await ephemeral.edit(content=f"🎧 Ripping {total or 'unknown'} track(s)...")
 
-    # Shared album art optimization
-    if include_art and total > 1:
-        ydl_opts["writethumbnail"] = False
-        await ephemeral.edit(content="🎨 Downloading shared album art...")
-        first_thumb = info["entries"][0].get("thumbnail")
+    # ---- album art optimization: download once for sets ----
+    if include_art and total and total > 1:
+        ydl_opts["writethumbnail"] = False    # avoid per-track art
+        first_thumb = (info.get("entries") or [{}])[0].get("thumbnail")
         if first_thumb:
-            thumb_path = os.path.join(session_dir, "album_art.jpg")
-            await asyncio.to_thread(download_file, first_thumb, thumb_path)
+            await ephemeral.edit(content="🎨 Downloading shared album art...")
+            art_path = os.path.join(session_dir, "album_art.jpg")
+            try:
+                await asyncio.to_thread(download_file, first_thumb, art_path)
+            except Exception:
+                pass
             await ephemeral.edit(content="🎨 Shared album art saved. Continuing rip...")
 
-    # ----------------------------------------------------------
-    # Run yt-dlp in async thread (real downloads)
-    # ----------------------------------------------------------
+    # ---- run rip (real downloads) ----
     await asyncio.to_thread(run_ytdlp, link, ydl_opts)
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.5)  # allow handles to close
 
-    # ----------------------------------------------------------
-    # Gather results
-    # ----------------------------------------------------------
-    files = [os.path.join(session_dir, f) for f in os.listdir(session_dir) if f.endswith(".mp3")]
+    # ---- collect output files ----
+    files = [os.path.join(session_dir, f) for f in os.listdir(session_dir) if f.lower().endswith(".mp3")]
+    files.sort()
     total_done = len(files)
     if total_done == 0:
         await ephemeral.edit(content="❌ No audio files were downloaded.")
         clean_dir(session_dir)
         return
 
-    # ----------------------------------------------------------
-    # Zipping Logic
-    # ----------------------------------------------------------
+    # ---- zipping choice/logic ----
     zip_mode = total_done > 10
     if 5 < total_done <= 10:
         zip_view = ZipChoice()
@@ -114,48 +126,78 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         await zip_view.wait()
         zip_mode = zip_view.choice or False
 
-    # ----------------------------------------------------------
-    # Uploads
-    # ----------------------------------------------------------
+    # ---- upload to Discord (always try to deliver in chat) ----
+    delivered = 0
+
     if zip_mode:
         await ephemeral.edit(content="📦 Zipping files...")
         zip_path = zip_folder(session_dir)
-        file_size = os.path.getsize(zip_path)
-        max_size = 8 * 1024 * 1024
-        if file_size > max_size:
-            mb = round(file_size / (1024 * 1024), 2)
-            await ephemeral.edit(
-                content=f"⚠️ File is {mb} MB — too large to send on Discord.\n"
-                        f"I’ll skip uploading it to avoid the 8 MB limit."
-            )
-        else:
+        if os.path.getsize(zip_path) <= DISCORD_MAX:
             await interaction.followup.send(file=discord.File(zip_path), ephemeral=False)
-            os.remove(zip_path)
+            delivered = 1
+            try: os.remove(zip_path)
+            except: pass
+        else:
+            # fallback: send individually (so user still gets files)
+            await ephemeral.edit(content="⚠️ ZIP > 8 MB. Sending tracks individually instead…")
+            delivered += await _send_tracks_individually(interaction, files)
     else:
-        await ephemeral.edit(content="📤 Uploading ripped tracks...")
-        max_size = 8 * 1024 * 1024
-        for idx, file in enumerate(files, 1):
-            size = os.path.getsize(file)
-            if size > max_size:
-                mb = round(size / (1024 * 1024), 2)
-                await ephemeral.edit(content=f"⚠️ `{os.path.basename(file)}` is {mb} MB — too large to send.")
-                continue
-            await interaction.followup.send(
-                f"🎶 `{idx}/{total_done}`", file=discord.File(file), ephemeral=False
-            )
-            await asyncio.sleep(0.25)
+        delivered += await _send_tracks_individually(interaction, files)
 
-    await ephemeral.edit(content="✅ Done! Cleaning up...")
+    # ---- finalize/public summary ----
+    elapsed = time.monotonic() - start_ts
+    mins, secs = divmod(int(elapsed), 60)
+    elapsed_text = f"{mins:02d}:{secs:02d}"
+
+    await ephemeral.edit(content="✅ Done! Cleaning up…")
     clean_dir(session_dir)
 
-    await public_msg.edit(content=f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** ✅")
-    await asyncio.sleep(2)
-    await ephemeral.delete()
+    await public_msg.edit(
+        content=f"{interaction.user.mention} ripped 🎶 **{total_done} track(s)** — {elapsed_text} @{target_bitrate_kbps} kbps ✅"
+    )
+    await asyncio.sleep(1.5)
+    try:
+        await ephemeral.delete()
+    except Exception:
+        pass
 
 
 # ==============================================================
-# SUPPORT FUNCTIONS
+# HELPERS
 # ==============================================================
+
+async def _send_tracks_individually(interaction: discord.Interaction, files: list[str]) -> int:
+    sent = 0
+    for idx, fp in enumerate(files, 1):
+        try:
+            size = os.path.getsize(fp)
+        except FileNotFoundError:
+            continue
+        if size > DISCORD_MAX:
+            # can't send file, let the user know ephemerally but keep going
+            mb = round(size / (1024 * 1024), 2)
+            try:
+                await interaction.followup.send(
+                    content=f"⚠️ `{os.path.basename(fp)}` is {mb} MB — too large for Discord (skipped).",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            continue
+
+        try:
+            await interaction.followup.send(
+                content=f"🎶 `{idx}/{len(files)}`",
+                file=discord.File(fp),
+                ephemeral=False
+            )
+            sent += 1
+            await asyncio.sleep(0.25)
+        except Exception:
+            # keep going even if one upload fails
+            continue
+    return sent
+
 
 def run_ytdlp(link, opts):
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -166,35 +208,46 @@ def extract_info(link, opts):
         return ydl.extract_info(link, download=False)
 
 async def on_progress(d, ephemeral_msg):
-    """Live progress bar with ETA + bitrate."""
-    if d["status"] == "downloading":
-        filename = d.get("filename", "unknown")
-        title = os.path.splitext(os.path.basename(filename))[0]
+    """Live progress: title + Discord-safe bar + percent + ETA + bitrate."""
+    if d.get("status") != "downloading":
+        return
 
-        percent = d.get("_percent_str", "0.0%").replace("%", "")
+    filename = d.get("filename", "unknown")
+    title = os.path.splitext(os.path.basename(filename))[0]
+
+    # derive percent robustly
+    pct = None
+    if "_percent_str" in d:
         try:
-            progress = float(percent) / 100
-        except ValueError:
-            progress = 0.0
-
-        eta = d.get("eta", 0)
-        eta_text = f"⏱️ ETA {int(eta)}s" if eta else ""
-        abr = d.get("abr", 192)
-        bitrate_text = f"{abr} kbps"
-
-        bar = progress_bar(progress)
-        text = f"🎶 **{title}**\n{bar} `{int(progress*100)}%`  {eta_text}  `{bitrate_text}`"
-
-        try:
-            await ephemeral_msg.edit(content=text)
+            pct = float(d["_percent_str"].replace("%", ""))
         except Exception:
-            pass
+            pct = None
+    if pct is None:
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        downloaded = d.get("downloaded_bytes") or 0
+        pct = (downloaded / total * 100.0) if total else 0.0
 
+    progress = max(0.0, min(1.0, pct / 100.0))
+    eta = d.get("eta")
+    abr = d.get("abr", 192)
+
+    eta_text = f"⏱️ ETA {int(eta)}s" if eta else ""
+    bar = progress_bar(progress)  # uses Discord-safe characters
+
+    text = (
+        f"🎶 **{title}**\n"
+        f"{bar}  `{int(progress*100)}%`  {eta_text}  `{abr} kbps`"
+    )
+    try:
+        await ephemeral_msg.edit(content=text)
+    except Exception:
+        pass
+
+# simple img/file fetch (for shared album art)
 def download_file(url: str, path: str):
-    """Simple file download for album art."""
     import requests
     r = requests.get(url, stream=True, timeout=10)
-    if r.status_code == 200:
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(1024):
-                f.write(chunk)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(1024):
+            f.write(chunk)
