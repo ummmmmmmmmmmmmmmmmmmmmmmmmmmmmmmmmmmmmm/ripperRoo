@@ -7,9 +7,10 @@ from ui_components import ArtChoice
 from utils import validate_link, clean_dir
 from config import ALLOWED_DOMAINS
 
-HEADROOM = 2 * 1024 * 1024  # 2 MiB under guild limit to avoid 413
+# Keep parts comfortably under the guild limit to avoid 413s.
+HEADROOM = 5 * 1024 * 1024  # 5 MiB safety margin
 
-# ---------- Progress UI helpers ----------
+# ---------- Progress UI ----------
 BAR_LEN = 50
 FILLED, EMPTY = "♪", "-"
 
@@ -39,38 +40,52 @@ async def _animated_public(interaction: discord.Interaction):
     task = asyncio.create_task(ticker())
     return msg, state, task
 
-async def _send_with_files_guaranteed(channel: discord.TextChannel, content: str, paths: list[str]):
-    """Always returns a message that has at least one attachment from `paths`."""
-    paths = [p for p in paths if p and os.path.isfile(p)]
-    if not paths: raise RuntimeError("No zip files to send.")
+async def _send_zips_as_replies(channel: discord.TextChannel, summary_msg: discord.Message, zips: list[str]):
+    """Always send each zip as its own message reply to summary_msg."""
+    total = len(zips)
+    for i, zp in enumerate(zips, start=1):
+        label = f"Part {i}/{total}" if total > 1 else "Download"
+        try:
+            await channel.send(content=f"📦 {label}", file=discord.File(zp), reference=summary_msg)
+        except Exception:
+            # try without reference if thread linking fails
+            try:
+                await channel.send(content=f"📦 {label}", file=discord.File(zp))
+            except Exception:
+                pass
+        await asyncio.sleep(0.2)
 
-    # Try batches down to 1
-    max_batch = min(len(paths), 10)
+async def _send_with_files_best_effort(channel: discord.TextChannel, content: str, zips: list[str]):
+    """
+    Try to send summary + attachments in ONE message (<=10 files). If that fails,
+    post the summary text-only, then follow-up with each ZIP as its own message.
+    """
+    zips = [p for p in zips if p and os.path.isfile(p)]
+    if not zips:
+        raise RuntimeError("No zip files to send.")
+
+    # Attempt single message with as many as possible (down to 1)
+    max_batch = min(len(zips), 10)
     for n in range(max_batch, 0, -1):
         try:
-            files = [discord.File(p) for p in paths[:n]]
-            summary = await channel.send(content=content, files=files)
-            # overflow as replies
-            for p in paths[n:]:
-                try: await channel.send(file=discord.File(p), reference=summary)
-                except Exception: pass
-                await asyncio.sleep(0.2)
-            return summary
+            files = [discord.File(p) for p in zips[:n]]
+            msg = await channel.send(content=content, files=files)
+            # overflow parts as replies
+            if len(zips) > n:
+                await _send_zips_as_replies(channel, msg, zips[n:])
+            return msg
+        except discord.HTTPException as e:
+            # If it's a 413 or similar, fall through to text+followups quickly
+            if getattr(e, "status", None) == 413 or "Payload Too Large" in str(e):
+                break
+            continue
         except Exception:
             continue
 
-    # File-only then edit summary
-    try:
-        m = await channel.send(file=discord.File(paths[0]))
-        try: await m.edit(content=content)
-        except Exception: pass
-        for p in paths[1:]:
-            try: await channel.send(file=discord.File(p), reference=m)
-            except Exception: pass
-            await asyncio.sleep(0.2)
-        return m
-    except Exception as e:
-        raise RuntimeError(f"Unable to attach ZIP: {e}")
+    # Fallback: summary text-only, then follow up each ZIP so users still get downloads
+    msg = await channel.send(content=content)
+    await _send_zips_as_replies(channel, msg, zips)
+    return msg
 
 async def handle_rip(interaction: discord.Interaction, link: str):
     started = time.monotonic()
@@ -82,59 +97,72 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         await eph.edit(content="❌ Unsupported or invalid link.")
         return
 
-    # Ask album art
+    # Album art choice (ephemeral)
     view = ArtChoice()
     await eph.edit(content="🎨 Include album art?", view=view)
     await view.wait()
     include_art = view.choice or False
     await eph.edit(content="Thank you for using Ripper Roo, your download will begin momentarily…", view=None)
 
-    # Public lightweight status
+    # Public ticker
     pub, pub_state, pub_task = await _animated_public(interaction)
 
-    # Ephemeral progress state + animator
+    # Ephemeral progress with smoothing
     loop = asyncio.get_running_loop()
-    prog = {"title":"…","p01":0.0,"eta":None,"abr":TARGET_ABR_KBPS,"status":"idle","active":True,"last":time.monotonic()}
+    prog = {
+        "title": "…",
+        "p01_target": 0.0,   # true % from hooks
+        "p01_smooth": 0.0,   # eased % for UI
+        "eta": None,
+        "abr": TARGET_ABR_KBPS,
+        "active": True,
+    }
+
     async def animator():
+        # smooth using exponential moving average toward target
+        alpha = 0.20  # smoothing factor; higher = faster
+        tick = 0.16   # ~6 fps
         while prog["active"]:
+            # ease toward target
+            t = prog["p01_target"]
+            s = prog["p01_smooth"]
+            prog["p01_smooth"] = s + alpha * (t - s)
             try:
-                await eph.edit(content=_render_bar(prog["p01"], prog["eta"], prog["abr"], prog["title"]))
-            except Exception: pass
-            await asyncio.sleep(0.15)
+                await eph.edit(content=_render_bar(prog["p01_smooth"], prog["eta"], prog["abr"], prog["title"]))
+            except Exception:
+                pass
+            await asyncio.sleep(tick)
     anim_task = asyncio.create_task(animator())
 
-    # Thread-safe progress callback for rip_core/yt-dlp
+    # Hook: update target % from yt-dlp; animator eases the bar
     def progress_cb(d: dict):
         def upd():
             status = d.get("status")
             fn = d.get("filename") or "unknown"
-            title = os.path.splitext(os.path.basename(fn))[0]
-            prog["title"] = title
+            prog["title"] = os.path.splitext(os.path.basename(fn))[0]
             if status == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
                 dl    = d.get("downloaded_bytes")
-                speed = d.get("speed") or 0
                 fragc = d.get("fragment_count") or d.get("n_fragments")
                 fragi = d.get("fragment_index")
                 if total and dl is not None:
-                    prog["p01"] = max(0.0, min(1.0, dl/total))
+                    prog["p01_target"] = max(0.0, min(1.0, dl/total))
                 elif fragc:
-                    prog["p01"] = max(0.0, min(1.0, ((fragi or 0)+1)/float(fragc)))
+                    prog["p01_target"] = max(0.0, min(1.0, ((fragi or 0)+1)/float(fragc)))
                 prog["eta"] = d.get("eta")
-                prog["abr"] = TARGET_ABR_KBPS
             elif status == "postprocessing":
-                prog["status"] = "postprocessing"
                 prog["eta"] = None
             elif status == "finished":
-                prog["p01"] = 1.0; prog["eta"] = 0
+                prog["p01_target"] = 1.0
+                prog["eta"] = 0
                 pub_state["done"] += 1
         loop.call_soon_threadsafe(upd)
 
-    # Compute safe per-file size
+    # Determine safe per-file size
     guild_limit = int(getattr(interaction.guild, "filesize_limit", 8 * 1024 * 1024))
     part_limit = max(1, guild_limit - HEADROOM)
 
-    # Rip in a worker thread (progress_cb is used by yt-dlp hooks)
+    # Run rip (yt-dlp+ffmpeg) with progress callback
     try:
         res = await asyncio.to_thread(rip_to_zips, link, include_art, part_limit, progress_cb)
     except Exception as e:
@@ -149,7 +177,7 @@ async def handle_rip(interaction: discord.Interaction, link: str):
         except Exception: pass
         return
 
-    # Close progress animations
+    # Close UI animations
     prog["active"] = False
     try: await anim_task
     except Exception: pass
@@ -160,19 +188,19 @@ async def handle_rip(interaction: discord.Interaction, link: str):
     try: await pub.delete()
     except Exception: pass
 
-    # Final summary + guaranteed attachments (same message)
+    # Final summary (suppress rich preview so files aren’t hidden by embeds)
     elapsed = int(time.monotonic() - started)
     mm, ss = divmod(elapsed, 60)
     elapsed_txt = f"{mm:02d}:{ss:02d}"
-    source_md = f"[Source](<{link}>)"  # suppress embed so files are visible
-
+    source_md = f"[Source](<{link}>)"
     summary = (f"{interaction.user.mention} ripped 🎶 **{res['count']} track(s)** "
                f"for {elapsed_txt} @ {TARGET_ABR_KBPS} kbps · {source_md} — **Download below ⤵️**")
 
+    # Try best effort: single message with attachments; if not, summary then follow-up ZIP posts
     try:
-        summary_msg = await _send_with_files_guaranteed(interaction.channel, summary, res["zips"])
+        await _send_with_files_best_effort(interaction.channel, summary, res["zips"])
     except Exception as e:
-        await eph.edit(content=f"❌ Failed to attach ZIP: `{e}`")
+        await eph.edit(content=f"❌ Failed to attach ZIP(s): `{e}`")
         clean_dir(res.get("work_dir") or tempfile.gettempdir())
         return
 
